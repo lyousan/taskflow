@@ -55,12 +55,16 @@ class SubmissionCapabilities:
 class PreparedSubmission:
     message_id: str
     queue: str
-    envelope_json: str
-    state_json: str
+    envelope: bytes
+    status: str
+    created_at: datetime
     expires_at_ms: int | None
     dedup_scope: str | None
     dedup_key: str | None
     dedup_ttl_ms: int | None
+    max_attempts: int
+    serializer_name: str
+    serializer_version: str
 
 
 @dataclass(frozen=True)
@@ -83,7 +87,7 @@ class SubmissionStore(Protocol):
     ) -> list[SubmitResult]: ...
 ```
 
-`PreparedSubmission` 是 Broker 内部已完成校验和 JSON 序列化的对象；应用代码不直接构造它。
+`PreparedSubmission` 是 Broker 内部已完成校验、ID 生成和 serializer bytes 编码的对象；应用代码不直接构造它。Store 必须仅依赖该对象完成原子准入、dedup、消息入队、初始状态和过期索引写入，不能依赖隐藏回调。
 
 ## 内置提交策略
 
@@ -91,24 +95,31 @@ class SubmissionStore(Protocol):
 |---|---|---:|---:|---:|
 | `RedisSubmissionStore` | 无去重 | 否 | 否 | 是 |
 | `RedisStringDedupSubmissionStore` | 精确 | 是 | 是 | 是 |
-| `SQLiteSubmissionStore` | 无去重或精确 | 精确模式支持 | 精确模式支持 | 是 |
+| `SQLiteSubmissionStore` | 精确（未提供 key 时跳过） | 是 | 是 | 是 |
 | `RedisBloomDedupSubmissionStore` | 概率性 | 否（仅 scope / bucket 级） | 否 | 否，v0.2 optional |
 
-业务通过 Broker 配置的具名 submission profile 选择策略，而不是在每次 `submit()` 调用中传入一个任意 Python store 对象：
+Broker 默认分别使用 `SQLiteSubmissionStore` 与 `RedisStringDedupSubmissionStore`。也可用
+`submission_stores` 和 `queue_submission_profiles` 将不同队列路由到不同 profile；未配置
+queue 使用 `default`，混合 queue 的 `submit_many()` 按 profile 分组执行并保持输入顺序。
+每个 queue 的实际语义可通过 `submission_capabilities(queue)` 查询：
 
 ```python
 broker = RedisBroker(
+    redis,
+    namespace="taskflow",
     submission_stores={
-        "default": RedisSubmissionStore(redis),
-        "exact": RedisStringDedupSubmissionStore(redis),
+        "default": RedisSubmissionStore(redis, namespace="taskflow"),
+        "exact": RedisStringDedupSubmissionStore(redis, namespace="taskflow"),
     },
-    queue_submission_profiles={
-        "crawl.fetch": "exact",
-    },
+    queue_submission_profiles={"crawl.fetch": "exact"},
 )
 ```
 
-这样同一个队列的所有生产者使用一致的准入语义。
+自定义 Store 直接接收完整的 `PreparedSubmission`，因此可以实现自己的原子准入语义。
+
+DLQ / EQ replay 默认 `reuse_dedup=True`，保留原 scope/key 与其记录。传入
+`reuse_dedup=False` 会移除原记录；同时提供新的 `dedup_scope`、`dedup_key` 和正数
+`dedup_ttl` 则会原子替换记录。目标 queue 的变化不会自动改写 dedup scope。
 
 ## 精确 String Dedup
 

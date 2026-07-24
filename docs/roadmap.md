@@ -1,0 +1,769 @@
+# Taskflow 开发路线图
+
+本文是 Taskflow 从 v0.1 MVP 发展到可直接用于一般生产项目的开发计划。它同时是版本规划、架构约束、任务拆分和验收标准，开发实现应以本文和现有设计文档为共同基线。
+
+相关设计基线：
+
+- [PRD](PRD.md)：产品范围、可靠性语义和非目标；
+- [概念模型](concepts.md)：消息、Delivery、lease、DLQ、EQ；
+- [Redis 生命周期](redis-lifecycle.md)：Redis 状态转换和原子边界；
+- [SQLite backend](sqlite-backend.md)：SQLite 的适用范围和事务语义；
+- [SubmissionStore 与去重](submission-and-dedup.md)：提交扩展点和 dedup 语义；
+- [运维说明](operations.md)：当前 v0.1 的部署与排障边界。
+
+---
+
+## 1. 总体目标
+
+Taskflow 最终应同时满足以下目标：
+
+1. **开箱即用**：本地使用 SQLite，无需 Redis 即可提交和消费任务；
+2. **人体工程学**：普通用户只需理解 `submit()`、`worker()`、handler 和重试策略；
+3. **可靠性明确**：at-least-once、显式副作用确认、lease、retry、DLQ、EQ 和 dedup 语义不含糊；
+4. **后端可替换**：SQLite 适用于本地/测试/单机，Redis 适用于多进程/多实例；
+5. **扩展点稳定**：SubmissionStore、Serializer、Middleware、Metrics 和 Worker 策略均有明确 Protocol；
+6. **可运维**：能够查看队列、消息、lease、DLQ/EQ、健康状态和关键指标；
+7. **可发布**：具备类型、测试、lint、构建、迁移和版本兼容文档。
+
+Taskflow **不承诺 exactly-once 业务处理**。所有版本都必须保留以下核心原则：
+
+- 消息投递最多一次的保证不是目标，默认是 at-least-once；
+- ACK 只能发生在业务副作用成功之后；
+- handler 必须幂等，或使用业务去重；
+- dedup 只约束提交准入，不等于业务处理 exactly-once；
+- Redis/SQLite 的差异必须通过 capabilities 和文档显式暴露。
+
+---
+
+## 2. 版本总览
+
+| 版本 | 主题 | 主要结果 |
+|---|---|---|
+| v0.2 | 高层 Worker 与任务执行体验 | 用户不再需要手动管理 claim/ACK/retry；支持延迟重试 |
+| v0.3 | 配置、扩展点与可观测性 | 按 queue 配置策略，提供稳定的 metrics/events 和 serializer 边界 |
+| v0.4 | 性能、管理能力与类型化 | 批量提交、类型化任务、管理 API/CLI、replay 策略完整 |
+| v0.5 | 生产化与兼容性 | 压测、故障演练、迁移、健康检查、发布质量和稳定 API |
+
+版本不是简单的时间节点。每个版本只有在“功能、测试、文档、兼容性和验收”全部完成后才允许发布。
+
+---
+
+# 3. v0.2：高层 Worker 与任务执行体验
+
+## 3.1 版本目标
+
+v0.2 的目标是把 v0.1 的可靠性内核包装成可直接用于应用开发的任务 Worker，同时增加延迟重试。
+
+用户应能够这样使用：
+
+```python
+from taskflow import SQLiteBroker
+from taskflow.retry import ExponentialBackoff, RetryPolicy
+
+
+async def handle_email(message):
+    await send_email(message.payload)
+
+
+async with SQLiteBroker("tasks.db") as broker:
+    await broker.submit("emails", {"to": "user@example.com"})
+    async with broker.worker(
+        "emails",
+        handle_email,
+        concurrency=10,
+        retry_policy=RetryPolicy(
+            max_attempts=5,
+            backoff=ExponentialBackoff(initial=1, maximum=60),
+        ),
+    ) as worker:
+        await worker.run()
+```
+
+## 3.2 功能范围
+
+### A. Worker API
+
+新增高层 API：
+
+```python
+worker = broker.worker(
+    queue: str,
+    handler: Callable[[TaskMessage], Awaitable[None]],
+    *,
+    concurrency: int = 1,
+    consumer_id: str | None = None,
+    options: ConsumerOptions | None = None,
+    retry_policy: RetryPolicy | None = None,
+)
+```
+
+Worker 必须负责：
+
+- 按 `concurrency` 限制同时处理的消息数；
+- 自动 claim；
+- handler 正常返回后 ACK；
+- handler 异常后按策略 retry 或 reject；
+- 达到最大尝试次数后进入 DLQ；
+- 进程停止时停止领取新消息并等待当前任务；
+- 取消任务时不伪造 ACK；
+- 复用现有 lease 和 stale delivery 防护；
+- 使用 middleware 发出与低层 API 一致的事件。
+
+Worker 不应改变底层 Delivery 语义。高级 API 只是对底层 `consumer()` 和 `Delivery` 的安全封装。
+
+### B. RetryPolicy
+
+新增策略对象：
+
+```python
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_attempts: int = 3
+    backoff: Backoff = ImmediateBackoff()
+    retry_on: tuple[type[BaseException], ...] = (Exception,)
+    reject_on: tuple[type[BaseException], ...] = ()
+```
+
+至少实现：
+
+- `ImmediateBackoff`；
+- `FixedBackoff`；
+- `ExponentialBackoff`；
+- 最大延迟限制；
+- 可选 jitter；
+- 明确 attempt 从 1 开始还是从 0 开始，并与现有状态保持一致。
+
+### C. 延迟重试
+
+延迟重试必须满足：
+
+- retry 请求和 retry 状态迁移保持原子性；
+- 消息在 delay 时间内不会被普通 claim；
+- delay 到期后重新进入 READY；
+- Redis 使用 server time 或等价的服务端时间语义；
+- SQLite 使用同一数据库时间/事务语义；
+- 进程崩溃后延迟消息仍可恢复；
+- retry delay 与 `expires_at` 同时存在时，不能在过期后重新投递；
+- DLQ/EQ 统计保持正确。
+
+### D. 高层异常
+
+新增：
+
+```python
+class RetryableError(Exception):
+    pass
+
+
+class RejectMessage(Exception):
+    pass
+```
+
+Worker 默认行为应可配置：
+
+- `RetryableError`：retry；
+- `RejectMessage`：reject；
+- 其他异常：默认 retry，或由 `RetryPolicy` 决定；
+- `CancelledError`：不执行普通 reject/retry，交给 shutdown 逻辑处理。
+
+## 3.3 v0.2 不做的事情
+
+- 不实现 exactly-once；
+- 不引入分布式锁；
+- 不改变现有 SQLite/Redis 状态模型；
+- 不实现按 queue 的不同 SubmissionStore；
+- 不实现管理 CLI；
+- 不在 Worker 内自动执行不可逆业务副作用。
+
+## 3.4 v0.2 验收标准
+
+- 能以 `worker(..., concurrency=N)` 同时处理最多 N 条消息；
+- handler 成功后自动 ACK；
+- handler 崩溃、异常和取消的行为有测试；
+- retry backoff 在 SQLite 和 Redis 上均有测试；
+- 延迟 retry 不会提前被 claim；
+- 进程在 retry 等待期间重启后消息仍可处理；
+- graceful shutdown 不丢失已领取但未 ACK 的消息；
+- README 有 10 分钟快速上手示例；
+- 至少有一个 SQLite Worker 示例和一个 Redis Worker 示例。
+
+---
+
+# 4. v0.3：配置、扩展点与可观测性
+
+## 4.1 版本目标
+
+v0.3 解决“能运行”之外的架构一致性问题：不同队列可以有不同策略，自定义 Store/Serializer/Metrics 有稳定接口，系统状态可观察。
+
+## 4.2 功能范围
+
+### A. QueueConfig
+
+新增统一配置对象：
+
+```python
+@dataclass(frozen=True)
+class QueueConfig:
+    max_attempts: int = 3
+    lease: timedelta = timedelta(minutes=5)
+    retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
+    default_dedup_ttl: timedelta | None = None
+    max_payload_bytes: int | None = None
+```
+
+Broker 支持：
+
+```python
+broker = SQLiteBroker(
+    "tasks.db",
+    queues={
+        "emails": QueueConfig(max_attempts=5),
+        "webhooks": QueueConfig(max_attempts=10),
+    },
+)
+```
+
+配置优先级必须固定并写入文档：
+
+```text
+单次 submit/worker 参数 > queue 配置 > broker 默认值
+```
+
+### B. 按 queue 选择 SubmissionStore
+
+实现：
+
+```python
+broker = RedisBroker(
+    redis,
+    submission_stores={
+        "default": RedisSubmissionStore(redis),
+        "exact": RedisStringDedupSubmissionStore(redis),
+    },
+    queue_submission_profiles={
+        "emails": "exact",
+        "audit-events": "default",
+    },
+)
+```
+
+要求：
+
+- profile 名称必须经过校验；
+- 未配置 queue 使用 default profile；
+- `submit()` 根据 queue 选择 Store；
+- `submit_many()` 不允许静默混合不兼容 profile；
+- capability 能反映实际被选中的 Store；
+- 自定义 Store 不得依赖 Broker 的隐藏回调；
+- profile 配置错误应在启动时尽早失败。
+
+### C. 严格命名规则
+
+queue、namespace、profile 使用统一规则：
+
+```text
+[A-Za-z0-9][A-Za-z0-9._-]{0,127}
+```
+
+禁止：
+
+- 空白和控制字符；
+- `{}`、`:`、`*`、`[`、`]`；
+- 前后空格；
+- 超过最大长度；
+- 只包含 `.` 或 `-` 的无意义名称。
+
+SQLite 和 Redis 必须共享同一套公共校验函数和测试。
+
+### D. 标准化事件和指标
+
+新增事件 Protocol：
+
+```python
+class EventSink(Protocol):
+    async def emit(self, event: TaskflowEvent) -> None: ...
+```
+
+新增指标 Protocol：
+
+```python
+class MetricsSink(Protocol):
+    async def increment(self, name: str, value: int = 1, **labels: str) -> None: ...
+    async def observe(self, name: str, value: float, **labels: str) -> None: ...
+    async def gauge(self, name: str, value: float, **labels: str) -> None: ...
+```
+
+标准事件字段：
+
+- `event_name`；
+- `timestamp`；
+- `queue`；
+- `message_id`；
+- `delivery_id`；
+- `consumer_id`；
+- `attempt`；
+- `status`；
+- `reason`；
+- `error_type`；
+- `backend`。
+
+标准指标至少包括：
+
+- `submitted_total`；
+- `duplicate_total`；
+- `claimed_total`；
+- `acked_total`；
+- `retried_total`；
+- `reclaimed_total`；
+- `dead_lettered_total`；
+- `expired_total`；
+- `lease_lost_total`；
+- processing duration；
+- queue ready/leased gauge。
+
+指标 label 必须控制 cardinality，不能默认使用完整 dedup key 或 payload。
+
+### E. Serializer 边界
+
+v0.3 至少完成以下两种方案之一：
+
+1. 实现 `SerializerRegistry`，按 `serializer_name + serializer_version` 选择解码器；
+2. 明确声明一个 Broker 实例只能使用一个 serializer，并在文档中定义升级迁移步骤。
+
+推荐实现 registry：
+
+```python
+registry.register("json", "1", JsonSerializer())
+registry.register("msgpack", "1", MsgpackSerializer())
+```
+
+找不到 serializer 时必须返回明确的 `SerializerUnavailableError`，不能表现为普通 JSON 解码异常。
+
+## 4.3 v0.3 验收标准
+
+- 两个 queue 可以使用不同 SubmissionStore；
+- 自定义 Store 能只依赖 `PreparedSubmission` 工作；
+- 所有 queue/namespace 特殊字符测试通过；
+- Worker、submit、claim、retry、DLQ、EQ 均有标准事件；
+- 可注入自定义 MetricsSink；
+- serializer 不匹配有明确错误和测试；
+- 配置优先级、启动校验和 capability 文档完整。
+
+---
+
+# 5. v0.4：性能、类型化与管理能力
+
+## 5.1 版本目标
+
+v0.4 让 Taskflow 更适合中等规模应用：减少批量操作往返，提供类型化 payload，提供程序化和 CLI 管理能力，完善 DLQ/EQ replay。
+
+## 5.2 功能范围
+
+### A. 类型化任务
+
+支持 dataclass、TypedDict 或 Pydantic model，核心 API 示例：
+
+```python
+@dataclass
+class ResizeImage:
+    image_id: str
+    width: int
+    height: int
+
+
+await broker.submit("image.resize", ResizeImage("img-1", 800, 600))
+
+worker = broker.worker(
+    "image.resize",
+    handle_resize,
+    payload_type=ResizeImage,
+)
+```
+
+要求：
+
+- 类型化只影响 payload 编码/解码，不改变消息生命周期；
+- 解码失败进入明确的 poison-message 处理路径；
+- schema/version 与 serializer version 分离；
+- 原始 envelope 仍可在 DLQ/EQ 中保留；
+- 不允许通过类型转换掩盖数据损坏。
+
+### B. SQLite 批量提交
+
+实现 `SQLiteSubmissionStore.submit_many()` 的单事务版本：
+
+```text
+BEGIN IMMEDIATE
+  批量 dedup 清理
+  批量 dedup 检查与写入
+  批量 messages 写入
+  批量 expires 索引写入
+  批量 submitted counter
+COMMIT
+```
+
+明确两种模式：
+
+- `atomic=True`：任一条失败，整批回滚；
+- `atomic=False`：逐条返回结果。
+
+`SubmissionCapabilities.batch_submit` 必须准确表示 Store 支持的模式。
+
+### C. Redis 批量提交
+
+优先实现单次网络往返的批量提交；如无法提供完整批量回滚，必须保留逐条结果：
+
+```python
+results = await broker.submit_many(
+    "emails",
+    messages,
+    atomic=False,
+)
+```
+
+Redis Lua 或 pipeline 实现必须保证每一条消息内部的：
+
+```text
+dedup 准入 + message state + stream entry + expiry index
+```
+
+仍然是原子操作。
+
+### D. 完整 replay 语义
+
+DLQ/EQ replay 增加：
+
+```python
+await broker.admin.replay_dead_letter(
+    queue="emails",
+    message_id=message_id,
+    reset_attempt=True,
+    target_queue="emails.repaired",
+    dedup_mode="replace",  # keep / remove / replace
+    dedup_scope="repair-batch-1",
+    dedup_key="user:123",
+    dedup_ttl=timedelta(days=1),
+)
+```
+
+要求：
+
+- replay 与 DLQ/EQ 记录删除在同一原子边界内；
+- dedup record 的保留、删除、替换策略明确；
+- 目标队列不存在或配置不兼容时不破坏原记录；
+- replay 后 Stream、state、ready/expiry index 一致；
+- 重复 replay 幂等或返回明确的 not found。
+
+### E. Admin API 与 CLI
+
+程序化 API：
+
+```python
+stats = await broker.inspect("emails")
+message = await broker.inspect_message(message_id)
+dead_letters = await broker.admin.list_dead_letters("emails")
+await broker.admin.replay_dead_letter(...)
+```
+
+CLI 示例：
+
+```bash
+taskflow queue inspect emails
+taskflow queue list-dead-letters emails
+taskflow message inspect <message-id>
+taskflow dlq replay emails <message-id>
+taskflow health
+```
+
+CLI 必须：
+
+- 默认只读；
+- 删除/replay 等破坏性操作要求显式确认或 `--yes`；
+- 支持 JSON 输出；
+- 显示 backend、namespace 和 queue；
+- 不打印 payload 中的敏感字段，除非用户显式要求。
+
+## 5.3 v0.4 验收标准
+
+- SQLite 批量提交有事务回滚测试和性能基准；
+- Redis 批量提交网络往返明显少于逐条版本；
+- 类型化 payload 有成功、失败、版本不兼容测试；
+- replay 的 dedup keep/remove/replace 三种模式有测试；
+- Admin API 与 CLI 能完成常见排障操作；
+- 所有索引一致性检查通过；
+- 文档中明确批量提交的原子性和性能能力。
+
+---
+
+# 6. v0.5：生产化、兼容性与发布质量
+
+## 6.1 版本目标
+
+v0.5 的目标不是继续增加大量业务功能，而是让库具备可靠发布和长期维护的条件。
+
+## 6.2 功能范围
+
+### A. 健康检查与故障诊断
+
+新增：
+
+```python
+health = await broker.health_check()
+```
+
+至少检查：
+
+- backend 连接；
+- schema 版本；
+- Redis Consumer Group；
+- 必要索引；
+- serializer registry；
+- namespace 配置；
+- 当前不可恢复错误。
+
+返回结构化结果：
+
+```python
+HealthReport(
+    healthy=True,
+    backend="redis",
+    checks=[
+        HealthCheck(name="connection", status="ok"),
+        HealthCheck(name="consumer_group", status="ok"),
+    ],
+)
+```
+
+### B. 索引一致性和修复
+
+新增只读检查：
+
+```python
+report = await broker.check_consistency("emails")
+```
+
+检查：
+
+- READY state 是否有 Stream entry；
+- READY state 是否有 ready index；
+- LEASED state 是否有 lease index；
+- EXPIRED 是否在 EQ；
+- DEAD_LETTERED 是否在 DLQ；
+- entry 中的 message_id 是否存在；
+- 重复的 DLQ/EQ 条目；
+- stale PEL。
+
+修复必须显式调用：
+
+```python
+await broker.repair_consistency("emails", dry_run=True)
+```
+
+默认只能 dry-run，不能自动删除用户数据。
+
+### C. 压测与故障演练
+
+建立可重复的 benchmark：
+
+- SQLite submit 吞吐；
+- SQLite batch submit 吞吐；
+- Redis submit 吞吐；
+- Redis batch submit 吞吐；
+- claim/ACK 吞吐；
+- retry/reclaim 吞吐；
+- 大 payload；
+- 高 dedup 冲突率；
+- 多 consumer 并发。
+
+建立故障测试：
+
+- claim 后进程崩溃；
+- ACK 前 Redis 连接断开；
+- Lua 执行前后客户端断开；
+- SQLite 进程中断；
+- Worker graceful shutdown；
+- serializer 不可用；
+- DLQ replay 并发冲突。
+
+### D. 数据库和 key 迁移
+
+SQLite：
+
+- schema version 表；
+- 向前迁移脚本；
+- 迁移失败 rollback；
+- 备份建议；
+- 旧版本兼容窗口。
+
+Redis：
+
+- key namespace version；
+- Consumer Group 初始化/升级策略；
+- 老字段兼容读取；
+- 废弃 key 清理工具；
+- 滚动升级期间的兼容行为。
+
+### E. 发布质量
+
+v0.5 发布前必须具备：
+
+- `ruff check`；
+- 类型检查；
+- 完整 pytest；
+- Redis 集成测试标识和 CI service；
+- package build；
+- 最低 Python 版本验证；
+- API 文档；
+- CHANGELOG；
+- upgrade guide；
+- 安全策略；
+- license 和贡献指南；
+- semver 兼容性声明。
+
+## 6.3 v0.5 验收标准
+
+- 可通过官方 CI 在无人工操作下运行 SQLite 和 Redis 测试；
+- Redis 不可用、schema 不匹配、serializer 不可用时都有清晰错误；
+- 能通过 health/consistency API 定位常见问题；
+- 有基准数据和推荐容量边界；
+- 有从 v0.1/v0.2/v0.3/v0.4 升级到 v0.5 的文档；
+- 公共 API、废弃 API 和兼容策略明确；
+- 以 v0.5 为第一个适合较长期依赖的稳定预发布版本。
+
+---
+
+# 7. 推荐代码组织
+
+为了避免所有能力继续堆积在 Broker 类中，建议逐步采用以下结构：
+
+```text
+src/taskflow/
+  broker/
+    base.py
+    sqlite.py
+    redis.py
+  worker/
+    base.py
+    runtime.py
+    policies.py
+  submission/
+    base.py
+    sqlite.py
+    redis.py
+  serialization/
+    base.py
+    json.py
+    registry.py
+  observability/
+    events.py
+    metrics.py
+    middleware.py
+  admin/
+    api.py
+    consistency.py
+  cli/
+    main.py
+  retry/
+    policy.py
+    backoff.py
+```
+
+分层原则：
+
+- `broker` 负责后端连接和生命周期；
+- `submission` 负责提交原子边界；
+- `worker` 负责高层执行模型；
+- `serialization` 负责 envelope 和版本；
+- `observability` 负责事件/指标协议；
+- `admin` 负责查看、replay、修复；
+- `cli` 只调用 Admin API，不重复实现业务逻辑。
+
+Worker 不应直接拼 Redis key，Admin 不应绕过 Store 修改提交状态，CLI 不应包含 backend-specific 状态迁移逻辑。
+
+---
+
+# 8. 每个版本的开发工作流
+
+每个功能都必须按以下顺序落地：
+
+1. 更新设计文档和 Protocol；
+2. 明确状态迁移和原子边界；
+3. 先写 backend-independent 测试；
+4. 分别实现 SQLite 和 Redis；
+5. 增加崩溃、重试、并发和异常测试；
+6. 增加公开 API 示例；
+7. 更新 README、operations 和 migration 文档；
+8. 运行单元测试、Redis 集成测试、lint、类型检查和构建；
+9. 记录 capability 差异和已知限制；
+10. 完成版本验收清单后再修改版本号。
+
+禁止只以“测试通过”作为版本完成标准。以下内容缺一不可：
+
+```text
+实现 + 测试 + 文档 + 兼容性 + 运维说明
+```
+
+---
+
+# 9. 优先级建议
+
+如果开发资源有限，优先级应为：
+
+## 必须优先
+
+1. v0.2 Worker；
+2. 真正实现 concurrency；
+3. RetryPolicy 与延迟 retry；
+4. queue/namespace 严格校验；
+5. 按 queue 选择 SubmissionStore；
+6. DLQ/EQ replay 的 dedup 策略。
+
+## 第二优先级
+
+7. 标准 EventSink/MetricsSink；
+8. serializer registry；
+9. SQLite 批量提交；
+10. Redis 批量提交；
+11. 类型化 payload；
+12. Admin API。
+
+## 发布前必须完成
+
+13. CLI；
+14. health check；
+15. consistency check/repair；
+16. 压测与故障演练；
+17. schema/key migration；
+18. CI、lint、类型检查和 package build。
+
+---
+
+# 10. 成熟度判断标准
+
+Taskflow 可以被认为达到“适合一般生产项目使用”的阶段，需要满足：
+
+- 新用户可以在 10 分钟内完成提交和 Worker 消费；
+- 常见异常不需要用户手写 ACK/Retry 状态机；
+- 后端差异不会导致静默的数据语义变化；
+- 所有不可逆操作都有 Admin API 和审计信息；
+- 消息状态在崩溃、重启和网络异常后可解释；
+- 队列积压、DLQ、过期消息和 lease 问题可观测；
+- 升级不会依赖手工修改 SQLite 表或 Redis key；
+- 公共 API 有类型、文档、测试和兼容策略；
+- 用户仍可以在需要时下沉到低层 Consumer/Delivery API。
+
+最终理想的用户体验是：
+
+```python
+broker = Taskflow.sqlite("tasks.db")
+
+await broker.submit("emails", SendEmail(...))
+
+await broker.run(
+    "emails",
+    handler=handle_email,
+    concurrency=10,
+)
+```
+
+简单路径足够简单，复杂路径仍然保留可靠性内核和可扩展的低层接口。

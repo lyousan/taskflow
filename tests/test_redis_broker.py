@@ -1,0 +1,230 @@
+"""使用本机 Redis 的 v0.1 生命周期集成测试。"""
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import timedelta
+from uuid import uuid4
+
+import pytest
+
+from taskflow import ConsumerOptions, LeaseLostError, RedisBroker, RedisStringDedupSubmissionStore, RedisSubmissionStore, SubmitRequest, ValidationError
+from taskflow.types import utc_now
+
+pytest.importorskip("redis.asyncio")
+
+
+class BinaryJsonSerializer:
+    name = "binary-json"
+    version = "7"
+
+    def dumps(self, value: object) -> bytes:
+        return b"\xff" + json.dumps(value, separators=(",", ":")).encode()
+
+    def loads(self, payload: bytes) -> object:
+        assert payload.startswith(b"\xff")
+        return json.loads(payload[1:].decode())
+
+
+async def clean(broker: RedisBroker) -> None:
+    """只清理本测试随机命名空间下的键，绝不影响其他 Redis 数据。"""
+
+    keys = [key async for key in broker._redis.scan_iter(match=f"{broker._namespace}:*")]
+    if keys:
+        await broker._redis.unlink(*keys)
+
+
+@pytest.fixture
+async def broker() -> RedisBroker:
+    """为每个用例隔离 Redis namespace，并在结束后回收测试键。"""
+
+    instance = RedisBroker.from_url(namespace=f"taskflow-test-{uuid4()}", pending_recovery_seconds=0.0)
+    await instance.start()
+    try:
+        yield instance
+    finally:
+        await clean(instance)
+        await instance.close()
+
+
+async def receive(broker: RedisBroker):
+    """领取一条 jobs 消息。"""
+
+    return await broker.consumer("jobs").__anext__()
+
+
+@pytest.mark.asyncio
+async def test_submit_dedup_retry_ack_and_stats(broker: RedisBroker) -> None:
+    """验证精确去重、立即重试和确认统计。"""
+
+    first = await broker.submit(queue="jobs", payload={"id": 1}, dedup_scope="test", dedup_key="one", dedup_ttl=timedelta(minutes=1))
+    duplicate = await broker.submit(queue="jobs", payload={"id": 1}, dedup_scope="test", dedup_key="one", dedup_ttl=timedelta(minutes=1))
+    assert first.accepted and not duplicate.accepted and duplicate.existing_message_id == first.message_id
+    assert await broker._redis.type(broker._queue_key("jobs", "stream")) == "stream"
+    delivery = await receive(broker)
+    await delivery.retry(reason="temporary")
+    assert await broker._redis.zcard(broker._queue_key("jobs", "ready")) == 1
+    retried = await receive(broker)
+    assert retried.attempt == 2
+    await retried.ack()
+    assert await broker._redis.zcard(broker._queue_key("jobs", "ready")) == 0
+    assert (await broker.inspect("jobs")).acked_total == 1
+
+
+@pytest.mark.asyncio
+async def test_binary_serializer_identity_and_ready_index(broker: RedisBroker) -> None:
+    broker._serializer = BinaryJsonSerializer()
+    submitted = await broker.submit(queue="jobs", payload={"binary": True})
+    state = await broker._redis.hgetall(broker._message_key(submitted.message_id))
+    assert (state["serializer_name"], state["serializer_version"]) == ("binary-json", "7")
+    assert await broker._redis.zcard(broker._queue_key("jobs", "ready")) == 1
+    stats = await broker.inspect("jobs")
+    assert stats.ready == 1 and stats.earliest_ready_at is not None
+    delivery = await receive(broker)
+    assert delivery.message.payload == {"binary": True}
+    await delivery.ack()
+
+
+@pytest.mark.asyncio
+async def test_redis_status_indexes_obey_lifecycle_invariants(broker: RedisBroker) -> None:
+    submitted = await broker.submit(queue="jobs", payload={})
+    message_key = broker._message_key(submitted.message_id)
+    stream = broker._queue_key("jobs", "stream")
+    ready = broker._queue_key("jobs", "ready")
+    leases = broker._queue_key("jobs", "leases")
+    assert (await broker._redis.hget(message_key, "status")) == "ready"
+    assert await broker._redis.zscore(ready, submitted.message_id) is not None
+    assert any(fields["message_id"] == submitted.message_id for _, fields in await broker._redis.xrange(stream))
+    delivery = await receive(broker)
+    assert (await broker._redis.hget(message_key, "status")) == "leased"
+    assert await broker._redis.zscore(ready, submitted.message_id) is None
+    assert await broker._redis.zscore(leases, submitted.message_id) is not None
+    await delivery.reject(reason="bad")
+    assert (await broker._redis.hget(message_key, "status")) == "dead_lettered"
+    assert submitted.message_id in await broker._redis.lrange(broker._queue_key("jobs", "dlq"), 0, -1)
+
+
+@pytest.mark.asyncio
+async def test_reject_lease_reclaim_and_expiry(broker: RedisBroker) -> None:
+    """验证 DLQ、租约回收和 EQ。"""
+
+    rejected = await broker.submit(queue="jobs", payload={"kind": "reject"})
+    await (await receive(broker)).reject(reason="invalid")
+    assert (await broker.admin.list_dead_letters("jobs"))[0].message.id == rejected.message_id
+
+    await broker.submit(queue="jobs", payload={"kind": "lease"}, max_attempts=1)
+    leased = await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=0.001)).__anext__()
+    await asyncio.sleep(0.01)
+    await broker.maintain("jobs")
+    assert any(item.message.id == leased.message.id for item in await broker.admin.list_dead_letters("jobs"))
+
+    expired = await broker.submit(queue="jobs", payload={"kind": "expired"}, expires_at=utc_now() - timedelta(seconds=1))
+    assert any(item.message.id == expired.message_id for item in await broker.admin.list_expired("jobs"))
+
+
+@pytest.mark.asyncio
+async def test_stale_lease_cannot_ack_and_expired_message_can_replay(broker: RedisBroker) -> None:
+    """回收后的旧 delivery 无权终结消息，EQ 消息可按新策略重放。"""
+
+    await broker.submit(queue="jobs", payload={"kind": "lease"})
+    old = await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=0.001)).__anext__()
+    await asyncio.sleep(0.01)
+    current = await receive(broker)
+    with pytest.raises(LeaseLostError):
+        await old.ack()
+    await current.ack()
+
+    result = await broker.submit(queue="jobs", payload={"kind": "expiry"}, expires_at=utc_now() - timedelta(seconds=1))
+    await broker.admin.replay_expired("jobs", result.message_id, expires_at=None)
+    replayed = await receive(broker)
+    assert replayed.message.id == result.message_id
+
+
+@pytest.mark.asyncio
+async def test_replay_can_remove_or_replace_dedup_without_losing_dlq(broker: RedisBroker) -> None:
+    first = await broker.submit(queue="jobs", payload={}, dedup_scope="old", dedup_key="one", dedup_ttl=timedelta(minutes=1))
+    await (await receive(broker)).reject(reason="repair")
+    await broker.admin.replay_dead_letter("jobs", first.message_id, reuse_dedup=False)
+    assert (await broker.submit(queue="jobs", payload={}, dedup_scope="old", dedup_key="one", dedup_ttl=timedelta(minutes=1))).accepted
+
+    replayed = await receive(broker)
+    await replayed.reject(reason="replace")
+    taken = await broker.submit(queue="jobs", payload={}, dedup_scope="replace", dedup_key="taken", dedup_ttl=timedelta(minutes=1))
+    with pytest.raises(ValidationError, match="其他消息"):
+        await broker.admin.replay_dead_letter("jobs", first.message_id, reuse_dedup=False,
+            dedup_scope="replace", dedup_key="taken", dedup_ttl=timedelta(minutes=1))
+    assert any(letter.message.id == first.message_id for letter in await broker.admin.list_dead_letters("jobs"))
+    assert taken.accepted
+
+
+@pytest.mark.asyncio
+async def test_pel_gap_is_recovered_after_consumer_crash(broker: RedisBroker) -> None:
+    """XREADGROUP 后、状态领取 Lua 前崩溃的消息必须重新进入可消费 Stream。"""
+
+    submitted = await broker.submit(queue="jobs", payload={"kind": "pel-gap"})
+    await broker._ensure_group("jobs")
+    stream = broker._queue_key("jobs", "stream")
+    received = await broker._redis.xreadgroup(broker._group_name(), "crashed-worker", {stream: ">"}, count=1)
+    assert received
+    await broker.maintain("jobs")
+    recovered = await receive(broker)
+    assert recovered.message.id == submitted.message_id
+    await recovered.ack()
+
+
+@pytest.mark.asyncio
+async def test_expired_lease_cannot_be_terminated_or_extended(broker: RedisBroker) -> None:
+    """维护循环尚未来得及执行时，失效租约也不能终结或续租。"""
+
+    await broker.submit(queue="jobs", payload={"kind": "expired-lease"})
+    delivery = await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=0.001)).__anext__()
+    await asyncio.sleep(0.01)
+    with pytest.raises(LeaseLostError):
+        await delivery.ack()
+    with pytest.raises(LeaseLostError):
+        await delivery.extend_lease(seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_extend_lease_is_capped_by_message_expiry(broker: RedisBroker) -> None:
+    await broker.submit(queue="jobs", payload={}, expires_at=utc_now() + timedelta(seconds=30))
+    delivery = await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=1)).__anext__()
+    extended = await delivery.extend_lease(seconds=300)
+    assert delivery.message.expires_at is not None
+    assert extended <= delivery.message.expires_at
+
+
+@pytest.mark.asyncio
+async def test_queue_profiles_route_submissions_and_preserve_batch_order() -> None:
+    namespace = f"taskflow-profile-{uuid4()}"
+    instance = RedisBroker.from_url(
+        namespace=namespace,
+        submission_stores={
+            "default": lambda broker: RedisSubmissionStore(broker),
+            "exact": lambda broker: RedisStringDedupSubmissionStore(broker),
+        },
+        queue_submission_profiles={"exact-jobs": "exact"},
+    )
+    await instance.start()
+    try:
+        assert instance.submission_capabilities("plain-jobs").dedup_guarantee.value == "none"
+        assert instance.submission_capabilities("exact-jobs").dedup_guarantee.value == "exact"
+        assert instance.submission_capabilities("exact-jobs").batch_submit
+        results = await instance.submit_many([
+            SubmitRequest(queue="exact-jobs", payload={"n": 1}, dedup_scope="s", dedup_key="same", dedup_ttl=timedelta(minutes=1)),
+            SubmitRequest(queue="plain-jobs", payload={"n": 2}),
+            SubmitRequest(queue="exact-jobs", payload={"n": 3}, dedup_scope="s", dedup_key="same", dedup_ttl=timedelta(minutes=1)),
+        ])
+        assert [result.accepted for result in results] == [True, True, False]
+    finally:
+        await clean(instance)
+        await instance.close()
+
+
+def test_redis_namespace_must_be_a_safe_persistent_identifier() -> None:
+    class UnusedRedis:
+        pass
+
+    for namespace in ("", "with:colon", "has{tag}", "中文", "x" * 256):
+        with pytest.raises(ValidationError, match="namespace"):
+            RedisBroker(UnusedRedis(), namespace=namespace)
