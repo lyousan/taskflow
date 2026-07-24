@@ -39,7 +39,7 @@ Taskflow **不承诺 exactly-once 业务处理**。所有版本都必须保留�
 
 | 版本 | 主题 | 主要结果 |
 |---|---|---|
-| v0.2 | 高层 Worker 与任务执行体验 | 用户不再需要手动管理 claim/ACK/retry；支持延迟重试 |
+| v0.2 | Worker 策略与任务执行增强 | 在 v0.1 RC Worker 基础上支持延迟重试、heartbeat 与更丰富策略 |
 | v0.3 | 配置、扩展点与可观测性 | 按 queue 配置策略，提供稳定的 metrics/events 和 serializer 边界 |
 | v0.4 | 性能、管理能力与类型化 | 批量提交、类型化任务、管理 API/CLI、replay 策略完整 |
 | v0.5 | 生产化与兼容性 | 压测、故障演练、迁移、健康检查、发布质量和稳定 API |

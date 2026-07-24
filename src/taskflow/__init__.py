@@ -1,5 +1,11 @@
 """Taskflow：独立、可嵌入、异步优先的任务消息框架。"""
-from .broker import RedisBroker, RedisStringDedupSubmissionStore, RedisSubmissionStore, SQLiteBroker, SQLiteSubmissionStore
+from .broker import (
+    RedisBroker,
+    RedisStringDedupSubmissionStore,
+    RedisSubmissionStore,
+    SQLiteBroker,
+    SQLiteSubmissionStore,
+)
 from .capabilities import BackendCapabilities, DedupGuarantee, SubmissionCapabilities
 from .errors import (
     BrokerClosedError,
@@ -8,12 +14,14 @@ from .errors import (
     UnsupportedCapabilityError,
     ValidationError,
 )
-from .serialization import JsonSerializer, Serializer, SerializerRegistry
 from .observability import BrokerEvent, MetricsSink
+from .protocols import SubmissionStore, TaskBroker, TaskConsumer, TaskDelivery
+from .serialization import JsonSerializer, Serializer, SerializerRegistry
 from .types import (
     ConsumerOptions,
     DeadLetter,
     ExpiredMessage,
+    FinishOutcome,
     MessageStatus,
     QueueStats,
     SubmitDecision,
@@ -25,12 +33,13 @@ from .worker import TaskWorker
 
 __all__ = [
     "BackendCapabilities",
-    "BrokerEvent",
     "BrokerClosedError",
+    "BrokerEvent",
     "ConsumerOptions",
     "DeadLetter",
     "DedupGuarantee",
     "ExpiredMessage",
+    "FinishOutcome",
     "JsonSerializer",
     "LeaseLostError",
     "MessageStatus",
@@ -44,9 +53,13 @@ __all__ = [
     "Serializer",
     "SerializerRegistry",
     "SubmissionCapabilities",
+    "SubmissionStore",
     "SubmitDecision",
     "SubmitRequest",
     "SubmitResult",
+    "TaskBroker",
+    "TaskConsumer",
+    "TaskDelivery",
     "TaskMessage",
     "TaskWorker",
     "TaskflowError",

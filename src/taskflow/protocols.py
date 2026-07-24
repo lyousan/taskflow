@@ -1,12 +1,38 @@
 """面向扩展者的异步公共协议。"""
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from typing import Protocol
+from collections.abc import Mapping
+from datetime import datetime, timedelta
+from typing import Any, Protocol
+
+from typing_extensions import Self
 
 from .capabilities import BackendCapabilities, SubmissionCapabilities
 from .submission.base import PreparedSubmission
-from .types import ConsumerOptions, QueueStats, SubmitRequest, SubmitResult
+from .types import (
+    ConsumerOptions,
+    FinishOutcome,
+    QueueStats,
+    SubmitRequest,
+    SubmitResult,
+    TaskMessage,
+)
+
+
+class TaskDelivery(Protocol):
+    """后端无关的 Delivery 最小契约。"""
+
+    message: TaskMessage
+    delivery_id: str
+    consumer_id: str
+    attempt: int
+    claimed_at: datetime
+    lease_until: datetime
+
+    async def ack(self) -> FinishOutcome: ...
+    async def retry(self, *, reason: str | None = None) -> FinishOutcome: ...
+    async def reject(self, *, reason: str, error: BaseException | None = None) -> FinishOutcome: ...
+    async def extend_lease(self, *, seconds: float | None = None) -> datetime: ...
 
 
 class TaskConsumer(Protocol):
@@ -14,7 +40,8 @@ class TaskConsumer(Protocol):
 
     async def start(self) -> None: ...
     async def close(self) -> None: ...
-    def __aiter__(self) -> AsyncIterator[object]: ...
+    def __aiter__(self) -> Self: ...
+    async def __anext__(self) -> TaskDelivery: ...
 
 
 class TaskBroker(Protocol):
@@ -24,7 +51,13 @@ class TaskBroker(Protocol):
 
     async def start(self) -> None: ...
     async def close(self) -> None: ...
-    async def submit(self, **kwargs: object) -> SubmitResult: ...
+    async def submit(
+        self, *, queue: str, payload: Any, metadata: Mapping[str, Any] | None = None,
+        dedup_key: str | None = None, dedup_scope: str | None = None,
+        dedup_ttl: timedelta | None = None, expires_at: datetime | None = None,
+        max_attempts: int | None = None, workflow_id: str | None = None,
+        parent_id: str | None = None,
+    ) -> SubmitResult: ...
     async def submit_many(self, messages: list[SubmitRequest]) -> list[SubmitResult]: ...
     def consumer(self, queue: str, *, consumer_id: str | None = None, options: ConsumerOptions | None = None) -> TaskConsumer: ...
     async def inspect(self, queue: str) -> QueueStats: ...
@@ -37,6 +70,8 @@ class SubmissionStore(Protocol):
 
     async def submit(self, submission: PreparedSubmission) -> SubmitResult:
         """在 backend 的原子边界内完成单条准入和入队。"""
+        ...
 
     async def submit_many(self, submissions: list[PreparedSubmission]) -> list[SubmitResult]:
         """在实现声明的批量语义下完成一组准入和入队。"""
+        ...

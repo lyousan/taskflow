@@ -1,12 +1,15 @@
 """可替换的指标与结构化生命周期事件。"""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
 from .middleware import Middleware
 from .types import TaskMessage, utc_now
+
+logger = logging.getLogger(__name__)
 
 
 class MetricsSink(Protocol):
@@ -29,12 +32,15 @@ class BrokerEvent:
     serializer_version: str | None = None
 
 
-async def metric(metrics: MetricsSink | None, name: str, value: int | float = 1, **labels: str) -> None:
+async def metric(metrics: MetricsSink | None, name: str, value: float = 1, **labels: str) -> None:
     if metrics is not None:
-        if isinstance(value, int):
-            await metrics.increment(name, value, **labels)
-        else:
-            await metrics.observe(name, value, **labels)
+        try:
+            if isinstance(value, int):
+                await metrics.increment(name, value, **labels)
+            else:
+                await metrics.observe(name, value, **labels)
+        except Exception:
+            logger.exception("taskflow metrics sink failed", extra={"metric": name})
 
 
 async def event(middleware: Middleware, name: str, message: TaskMessage, *, status: str | None = None,

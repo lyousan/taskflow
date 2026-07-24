@@ -17,13 +17,15 @@ from ..capabilities import BackendCapabilities, DedupGuarantee, SubmissionCapabi
 from ..errors import BrokerClosedError, LeaseLostError, ValidationError
 from ..middleware import Middleware
 from ..naming import validate_persistent_name
-from ..observability import MetricsSink, event as emit_event, metric
+from ..observability import MetricsSink, metric
+from ..observability import event as emit_event
 from ..serialization import JsonSerializer, Serializer, SerializerRegistry
 from ..submission import PreparedSubmission
 from ..types import (
     ConsumerOptions,
     DeadLetter,
     ExpiredMessage,
+    FinishOutcome,
     MessageStatus,
     QueueStats,
     SubmitDecision,
@@ -69,6 +71,7 @@ class SQLiteBroker:
         distributed_consumers=False,
         high_throughput=False,
         batch_submit=True,
+        batch_atomic=True,
     )
 
     def __init__(
@@ -116,6 +119,7 @@ class SQLiteBroker:
                 status TEXT NOT NULL, attempt INTEGER NOT NULL, max_attempts INTEGER NOT NULL,
                 created_at REAL NOT NULL, expires_at REAL, consumer_id TEXT,
                 delivery_id TEXT, lease_token TEXT, claimed_at REAL, lease_until REAL,
+                last_delivery_id TEXT, last_consumer_id TEXT,
                 last_action TEXT, last_reason TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_messages_claim ON messages(queue, status, created_at);
@@ -145,6 +149,10 @@ class SQLiteBroker:
             await self._connection.execute("ALTER TABLE messages ADD COLUMN serializer_name TEXT NOT NULL DEFAULT 'json'")
         if "serializer_version" not in columns:
             await self._connection.execute("ALTER TABLE messages ADD COLUMN serializer_version TEXT NOT NULL DEFAULT '1'")
+        if "last_delivery_id" not in columns:
+            await self._connection.execute("ALTER TABLE messages ADD COLUMN last_delivery_id TEXT")
+        if "last_consumer_id" not in columns:
+            await self._connection.execute("ALTER TABLE messages ADD COLUMN last_consumer_id TEXT")
         await self._connection.commit()
 
     async def start(self) -> None:
@@ -270,7 +278,7 @@ class SQLiteBroker:
         self._validate_queue(queue)
         if (dedup_key is None) != (dedup_scope is None):
             raise ValidationError("dedup_key 与 dedup_scope 必须同时提供")
-        ttl = dedup_ttl or self._default_dedup_ttl
+        ttl = self._default_dedup_ttl if dedup_ttl is None else dedup_ttl
         if dedup_key is not None and (ttl is None or ttl.total_seconds() <= 0):
             raise ValidationError("启用去重时必须提供正数 dedup_ttl 或配置默认值")
         attempts = max_attempts if max_attempts is not None else self._default_max_attempts
@@ -332,7 +340,7 @@ class SQLiteBroker:
                options: ConsumerOptions | None = None) -> TaskWorker:
         """创建一个真正受 ``concurrency`` 限制的 Worker。"""
         selected = options or ConsumerOptions()
-        return TaskWorker(self, queue, handler, concurrency=concurrency or selected.concurrency, options=selected)
+        return TaskWorker(self, queue, handler, concurrency=concurrency if concurrency is not None else selected.concurrency, options=selected)
 
     async def run(self, queue: str, handler: Handler, *, concurrency: int | None = None,
                   options: ConsumerOptions | None = None) -> None:
@@ -374,22 +382,23 @@ class SQLiteBroker:
         await cursor.execute(f"UPDATE queue_counters SET {column}={column}+1 WHERE queue=?", (queue,))
 
     async def _dead_letter(self, cursor: aiosqlite.Cursor, row: aiosqlite.Row, now: datetime, source: str,
-                           reason: str | None, error: BaseException | None = None) -> None:
+                           reason: str | None, error: BaseException | None = None,
+                           *, last_action: str | None = None) -> None:
         await cursor.execute("INSERT OR REPLACE INTO dead_letters VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                        (row["id"], row["queue"], row["attempt"], reason, source, _timestamp(now),
                         type(error).__name__ if error else None,
                         "".join(traceback_module.format_exception(error)) if error else None))
-        await cursor.execute("UPDATE messages SET status=?, lease_until=NULL, last_action=?, last_reason=? WHERE id=?",
-                       (MessageStatus.DEAD_LETTERED.value, source, reason, row["id"]))
+        await cursor.execute("UPDATE messages SET status=?, last_delivery_id=delivery_id, last_consumer_id=consumer_id, consumer_id=NULL, delivery_id=NULL, lease_token=NULL, claimed_at=NULL, lease_until=NULL, last_action=?, last_reason=? WHERE id=?",
+                       (MessageStatus.DEAD_LETTERED.value, last_action or source, reason, row["id"]))
         await self._counter(cursor, row["queue"], "dead_lettered_total")
 
     async def _expire(self, cursor: aiosqlite.Cursor, message_id: str, now: datetime, old_status: MessageStatus, attempt: int) -> None:
-        row = await (await cursor.execute("SELECT queue FROM messages WHERE id=?", (message_id,))).fetchone()
+        row = await (await cursor.execute("SELECT queue, delivery_id, consumer_id FROM messages WHERE id=?", (message_id,))).fetchone()
         if row is None:
             return
         await cursor.execute("INSERT OR REPLACE INTO expired_messages VALUES (?, ?, ?, ?, ?)",
                        (message_id, row["queue"], attempt, old_status.value, _timestamp(now)))
-        await cursor.execute("UPDATE messages SET status=?, lease_until=NULL, last_action='expired' WHERE id=?",
+        await cursor.execute("UPDATE messages SET status=?, last_delivery_id=delivery_id, last_consumer_id=consumer_id, consumer_id=NULL, delivery_id=NULL, lease_token=NULL, claimed_at=NULL, lease_until=NULL, last_action='expired' WHERE id=?",
                        (MessageStatus.EXPIRED.value, message_id))
 
     async def _maintain(self, cursor: aiosqlite.Cursor, now: datetime, queue: str | None = None) -> int:
@@ -406,7 +415,7 @@ class SQLiteBroker:
             if row["attempt"] >= row["max_attempts"]:
                 await self._dead_letter(cursor, row, now, "lease_timeout", "租约超时且已达到最大尝试次数")
             else:
-                await cursor.execute("UPDATE messages SET status=?, lease_until=NULL, last_action='reclaimed', last_reason=? WHERE id=?",
+                await cursor.execute("UPDATE messages SET status=?, last_delivery_id=delivery_id, last_consumer_id=consumer_id, consumer_id=NULL, delivery_id=NULL, lease_token=NULL, claimed_at=NULL, lease_until=NULL, last_action='reclaimed', last_reason=? WHERE id=?",
                                (MessageStatus.READY.value, "租约超时", row["id"]))
                 await self._counter(cursor, row["queue"], "reclaimed_total")
         return sum(1 for _ in expired) + sum(1 for _ in leases)
@@ -430,7 +439,7 @@ class SQLiteBroker:
                 raise
 
     async def _finish(self, delivery: SQLiteDelivery, action: str, reason: str | None = None,
-                      error: BaseException | None = None) -> None:
+                      error: BaseException | None = None) -> FinishOutcome:
         await self.start()
         now = self._now()
         async with self._lock:
@@ -441,34 +450,48 @@ class SQLiteBroker:
                 row = await (await cursor.execute("SELECT * FROM messages WHERE id=?", (delivery.message.id,))).fetchone()
                 if row is None:
                     raise LeaseLostError("消息不存在")
-                if row["delivery_id"] == delivery.delivery_id and row["last_action"] == action and row["status"] != MessageStatus.LEASED.value:
+                if row["last_delivery_id"] == delivery.delivery_id and row["last_action"] == action and row["status"] != MessageStatus.LEASED.value:
                     await cursor.execute("COMMIT")
-                    return
+                    return FinishOutcome.IDEMPOTENT
                 if (row["status"] != MessageStatus.LEASED.value or row["delivery_id"] != delivery.delivery_id or
                         row["lease_token"] != delivery._lease_token or row["lease_until"] <= _timestamp(now)):
                     raise LeaseLostError("租约已经失效，不能终结当前投递")
                 if row["expires_at"] is not None and row["expires_at"] <= _timestamp(now):
                     await self._expire(cursor, row["id"], now, MessageStatus.LEASED, row["attempt"])
+                    outcome = FinishOutcome.EXPIRED
                 elif action == "ack":
-                    await cursor.execute("UPDATE messages SET status=?, lease_until=NULL, last_action=?, last_reason=NULL WHERE id=?",
+                    await cursor.execute("UPDATE messages SET status=?, last_delivery_id=delivery_id, last_consumer_id=consumer_id, consumer_id=NULL, delivery_id=NULL, lease_token=NULL, claimed_at=NULL, lease_until=NULL, last_action=?, last_reason=NULL WHERE id=?",
                                    (MessageStatus.ACKED.value, action, row["id"]))
                     await self._counter(cursor, row["queue"], "acked_total")
+                    outcome = FinishOutcome.ACKED
                 elif action == "retry":
                     if row["attempt"] >= row["max_attempts"]:
-                        await self._dead_letter(cursor, row, now, "retry_limit", reason)
+                        await self._dead_letter(cursor, row, now, "retry_limit", reason, last_action="retry")
+                        outcome = FinishOutcome.DEAD_LETTERED
                     else:
-                        await cursor.execute("UPDATE messages SET status=?, lease_until=NULL, last_action=?, last_reason=? WHERE id=?",
+                        await cursor.execute("UPDATE messages SET status=?, last_delivery_id=delivery_id, last_consumer_id=consumer_id, consumer_id=NULL, delivery_id=NULL, lease_token=NULL, claimed_at=NULL, lease_until=NULL, last_action=?, last_reason=? WHERE id=?",
                                        (MessageStatus.READY.value, action, reason, row["id"]))
                         await self._counter(cursor, row["queue"], "retried_total")
+                        outcome = FinishOutcome.RETRIED
                 else:
                     await self._dead_letter(cursor, row, now, "reject", reason, error)
+                    outcome = FinishOutcome.DEAD_LETTERED
                 await cursor.execute("COMMIT")
             except Exception:
                 await cursor.execute("ROLLBACK")
                 raise
-        await self.middleware.emit(f"after_{action}", delivery, reason)
-        await metric(self.metrics, {"ack": "acked_total", "retry": "retried_total", "reject": "dead_lettered_total"}[action], queue=delivery.message.queue)
-        await emit_event(self.middleware, action, delivery.message, status=action, delivery=delivery, reason=reason, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+        actual = {
+            FinishOutcome.ACKED: ("ack", "acked_total"),
+            FinishOutcome.RETRIED: ("retry", "retried_total"),
+            FinishOutcome.DEAD_LETTERED: ("dead_lettered", "dead_lettered_total"),
+            FinishOutcome.EXPIRED: ("expired", "expired_total"),
+        }.get(outcome)
+        if actual is not None:
+            event_name, metric_name = actual
+            await self.middleware.emit(f"after_{event_name}", delivery, reason)
+            await metric(self.metrics, metric_name, queue=delivery.message.queue)
+            await emit_event(self.middleware, event_name, delivery.message, status=outcome.value, delivery=delivery, reason=reason, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+        return outcome
 
     async def _extend(self, delivery: SQLiteDelivery, seconds: float | None) -> datetime:
         await self.start()
@@ -538,6 +561,7 @@ class SQLiteSubmissionStore:
         stores_original_message_id=True,
         atomic_submit=True,
         batch_submit=True,
+        batch_atomic=True,
     )
 
     def __init__(self, broker: SQLiteBroker) -> None:
@@ -628,19 +652,19 @@ class SQLiteDelivery:
         self.message, self.delivery_id, self.consumer_id = message, delivery_id, consumer_id
         self.attempt, self.claimed_at, self.lease_until = attempt, claimed_at, lease_until
 
-    async def ack(self) -> None:
+    async def ack(self) -> FinishOutcome:
         """确认业务处理成功；同一投递重复确认是幂等的。"""
-        await self._broker._finish(self, "ack")
+        return await self._broker._finish(self, "ack")
 
-    async def retry(self, *, reason: str | None = None) -> None:
+    async def retry(self, *, reason: str | None = None) -> FinishOutcome:
         """立即重新投递；超过最大尝试次数会转入 DLQ。"""
-        await self._broker._finish(self, "retry", reason)
+        return await self._broker._finish(self, "retry", reason)
 
-    async def reject(self, *, reason: str, error: BaseException | None = None) -> None:
+    async def reject(self, *, reason: str, error: BaseException | None = None) -> FinishOutcome:
         """拒绝消息并写入 DLQ。"""
         if not reason:
             raise ValidationError("reject 必须提供非空 reason")
-        await self._broker._finish(self, "reject", reason, error)
+        return await self._broker._finish(self, "reject", reason, error)
 
     async def extend_lease(self, *, seconds: float | None = None) -> datetime:
         """延长当前 lease，且永不超过消息的 expires_at。"""
@@ -724,7 +748,7 @@ class SQLiteAdmin:
             raise ValidationError("dedup_scope 与 dedup_key 必须同时提供")
         if dedup_key is None:
             return replace(message, dedup_scope=None, dedup_key=None), None
-        ttl = dedup_ttl or self._broker._default_dedup_ttl
+        ttl = self._broker._default_dedup_ttl if dedup_ttl is None else dedup_ttl
         if ttl is None or ttl.total_seconds() <= 0:
             raise ValidationError("替换 dedup 时必须提供正数 dedup_ttl 或配置默认值")
         assert dedup_scope is not None

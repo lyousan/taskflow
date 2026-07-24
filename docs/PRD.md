@@ -4,7 +4,7 @@
 - **定位**：独立、可嵌入、异步优先的 Python 任务消息与处理框架
 - **形态**：Python package
 - **本文版本**：v0.1（MVP 设计基线）
-- **状态**：待立项
+- **状态**：v0.1.0 已发布
 
 相关设计补充：
 
@@ -425,7 +425,8 @@ taskflow_queue_delayed_messages  # v0.2
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, AsyncIterator, Protocol
+from typing import Any, Protocol
+from typing_extensions import Self
 
 
 class TaskBroker(Protocol):
@@ -466,7 +467,8 @@ class TaskBroker(Protocol):
 class TaskConsumer(Protocol):
     async def start(self) -> None: ...
     async def close(self) -> None: ...
-    def __aiter__(self) -> AsyncIterator[TaskDelivery]: ...
+    def __aiter__(self) -> Self: ...
+    async def __anext__(self) -> TaskDelivery: ...
 
 
 class TaskDelivery(Protocol):
@@ -477,9 +479,9 @@ class TaskDelivery(Protocol):
     claimed_at: datetime
     lease_until: datetime
 
-    async def ack(self) -> None: ...
-    async def retry(self, *, reason: str | None = None) -> None: ...  # v0.1：立即重投
-    async def reject(self, *, reason: str, error: BaseException | None = None) -> None: ...
+    async def ack(self) -> FinishOutcome: ...
+    async def retry(self, *, reason: str | None = None) -> FinishOutcome: ...  # v0.1：立即重投
+    async def reject(self, *, reason: str, error: BaseException | None = None) -> FinishOutcome: ...
     async def extend_lease(self, *, seconds: float | None = None) -> datetime: ...
 ```
 
@@ -988,7 +990,7 @@ Kafka backend 仅在完成独立 RFC、语义定义、故障演练和性能验�
 2. `attempt` 是总 Delivery 次数，首次领取为 1。
 3. 消息到期后转入每个逻辑队列对应的 **Expired Queue（EQ）**，不进入 DLQ。
 4. v0.1 不提供延迟投递、延迟重试或延迟调度器；它们进入 v0.2。
-5. `TaskWorker` 不纳入 v0.1，v0.1 只交付显式 Delivery API。
+5. v0.1 RC 提供 `TaskWorker` / `broker.worker()` 作为稳定的高层执行 API；它仅封装显式 Delivery 的 ACK/Retry 语义，不包含 v0.2 的延迟重试与自动 heartbeat。
 6. `task_type` 不作为 v0.1 的一等字段或 `submit()` 参数；队列承担消息路由职责。需要分类、schema 版本或业务标签时，由业务方写入 `metadata`。
 7. `headers` 更名为 `metadata`；其值必须 JSON-compatible。
 8. `dedup_namespace` 更名为 `dedup_scope`，以表达去重键的隔离范围。

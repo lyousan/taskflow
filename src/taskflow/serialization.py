@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Iterable, Protocol
+from collections.abc import Iterable
+from typing import Any, Protocol
 
 from .errors import ValidationError
 

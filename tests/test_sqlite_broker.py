@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import timedelta
 
 import pytest
@@ -10,14 +11,16 @@ import pytest
 from taskflow import (
     BrokerEvent,
     ConsumerOptions,
+    FinishOutcome,
     LeaseLostError,
+    SerializerRegistry,
     SQLiteBroker,
     SQLiteSubmissionStore,
-    SerializerRegistry,
     SubmitRequest,
     ValidationError,
 )
 from taskflow.middleware import Middleware
+from taskflow.submission import PreparedSubmission
 from taskflow.types import utc_now
 
 
@@ -48,8 +51,8 @@ async def test_submit_claim_ack_and_stats() -> None:
         delivery = await receive(broker)
         assert result.accepted and delivery.message.payload == {"id": 1}
         assert delivery.attempt == 1
-        await delivery.ack()
-        await delivery.ack()
+        assert await delivery.ack() is FinishOutcome.ACKED
+        assert await delivery.ack() is FinishOutcome.IDEMPOTENT
         stats = await broker.inspect("jobs")
         assert (stats.ready, stats.leased, stats.acked_total) == (0, 0, 1)
 
@@ -65,10 +68,14 @@ async def test_submit_many_preserves_input_order() -> None:
 @pytest.mark.asyncio
 async def test_sqlite_submit_many_is_one_atomic_transaction() -> None:
     async with SQLiteBroker(id_factory=lambda: "same-id") as broker:
-        with pytest.raises(Exception):
+        with pytest.raises(sqlite3.IntegrityError):
             await broker.submit_many([SubmitRequest(queue="jobs", payload={}), SubmitRequest(queue="jobs", payload={})])
         assert (await broker.inspect("jobs")).submitted_total == 0
+        row = await (await broker._connection.execute("SELECT COUNT(*) FROM messages")).fetchone()  # type: ignore[union-attr]
+        assert row is not None
+        assert row[0] == 0
         assert broker.submission_capabilities("jobs").batch_submit
+        assert broker.submission_capabilities("jobs").batch_atomic
 
 
 @pytest.mark.asyncio
@@ -76,7 +83,7 @@ async def test_submit_many_passes_complete_prepared_submissions_to_store() -> No
     class RecordingStore(SQLiteSubmissionStore):
         def __init__(self, broker: SQLiteBroker) -> None:
             super().__init__(broker)
-            self.batches = []
+            self.batches: list[list[PreparedSubmission]] = []
 
         async def submit_many(self, submissions):  # type: ignore[no-untyped-def]
             self.batches.append(submissions)
@@ -98,16 +105,40 @@ async def test_binary_serializer_and_identity_are_persisted(tmp_path) -> None:  
     async with SQLiteBroker(database, serializer=BinaryJsonSerializer()) as broker:
         submitted = await broker.submit(queue="jobs", payload={"binary": True})
         row = await (await broker._connection.execute("SELECT envelope, serializer_name, serializer_version FROM messages WHERE id=?", (submitted.message_id,))).fetchone()  # type: ignore[union-attr]
+        assert row is not None
         assert (row["serializer_name"], row["serializer_version"]) == ("binary-json", "7")
         assert broker._decode_message(row["envelope"], row["serializer_name"], row["serializer_version"]).payload == {"binary": True}
 
     async with SQLiteBroker(database) as incompatible:
         row = await (await incompatible._connection.execute("SELECT envelope, serializer_name, serializer_version FROM messages WHERE id=?", (submitted.message_id,))).fetchone()  # type: ignore[union-attr]
+        assert row is not None
         with pytest.raises(ValidationError, match="serializer"):
             incompatible._decode_message(row["envelope"], row["serializer_name"], row["serializer_version"])
 
     async with SQLiteBroker(database, serializer_registry=SerializerRegistry([BinaryJsonSerializer()])) as migrated:
         assert (await receive(migrated)).message.payload == {"binary": True}
+
+
+@pytest.mark.asyncio
+async def test_start_migrates_legacy_messages_schema_idempotently(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    database = tmp_path / "legacy.db"
+    connection = sqlite3.connect(database)
+    connection.execute("""
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY, queue TEXT NOT NULL, envelope BLOB NOT NULL,
+            status TEXT NOT NULL, attempt INTEGER NOT NULL, max_attempts INTEGER NOT NULL,
+            created_at REAL NOT NULL, expires_at REAL, consumer_id TEXT,
+            delivery_id TEXT, lease_token TEXT, claimed_at REAL, lease_until REAL,
+            last_action TEXT, last_reason TEXT
+        )
+    """)
+    connection.commit()
+    connection.close()
+    async with SQLiteBroker(database) as broker:
+        columns = {row[1] for row in await (await broker._connection.execute("PRAGMA table_info(messages)")).fetchall()}  # type: ignore[union-attr]
+        assert {"serializer_name", "serializer_version", "last_delivery_id", "last_consumer_id"} <= columns
+    async with SQLiteBroker(database):
+        pass
 
 
 @pytest.mark.asyncio
@@ -155,8 +186,8 @@ async def test_worker_honors_concurrency_and_retries_handler_errors() -> None:
 async def test_metrics_and_structured_events_cover_submission_claim_and_ack() -> None:
     class Recorder:
         def __init__(self) -> None:
-            self.increments = []
-            self.observations = []
+            self.increments: list[tuple[str, object, dict[str, object]]] = []
+            self.observations: list[tuple[str, object, dict[str, object]]] = []
 
         async def increment(self, name, value=1, **labels):  # type: ignore[no-untyped-def]
             self.increments.append((name, value, labels))
@@ -171,7 +202,7 @@ async def test_metrics_and_structured_events_cover_submission_claim_and_ack() ->
     async with SQLiteBroker(middleware=middleware, metrics=metrics) as broker:
         await broker.submit(queue="jobs", payload={})
         delivery = await receive(broker)
-        await delivery.ack()
+        assert await delivery.ack() is FinishOutcome.ACKED
         await broker.inspect("jobs")
     assert {name for name, _, _ in metrics.increments} >= {"submitted_total", "claimed_total", "acked_total"}
     assert {item.name for item in events} >= {"submitted", "claimed", "ack"}
@@ -206,6 +237,16 @@ async def test_retry_is_immediate_and_limit_routes_to_dlq() -> None:
 
 
 @pytest.mark.asyncio
+async def test_retry_limit_is_idempotent_for_the_original_delivery() -> None:
+    async with SQLiteBroker() as broker:
+        await broker.submit(queue="jobs", payload={}, max_attempts=1)
+        delivery = await receive(broker)
+        await delivery.retry(reason="limit")
+        await delivery.retry(reason="limit")
+        assert (await broker.admin.list_dead_letters("jobs"))[0].source == "retry_limit"
+
+
+@pytest.mark.asyncio
 async def test_reject_records_reason_and_exception() -> None:
     async with SQLiteBroker() as broker:
         await broker.submit(queue="jobs", payload={})
@@ -231,6 +272,22 @@ async def test_lease_reclaim_rejects_stale_delivery() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reclaim_clears_current_lease_and_preserves_audit_identity() -> None:
+    now = [utc_now()]
+    async with SQLiteBroker(clock=lambda: now[0]) as broker:
+        submitted = await broker.submit(queue="jobs", payload={})
+        delivery = await broker.consumer("jobs", consumer_id="worker-a", options=ConsumerOptions(lease_seconds=1)).__anext__()
+        now[0] += timedelta(seconds=2)
+        await broker.maintain("jobs")
+        row = await (await broker._connection.execute("SELECT * FROM messages WHERE id=?", (submitted.message_id,))).fetchone()  # type: ignore[union-attr]
+        assert row is not None
+        assert row["status"] == "ready"
+        assert all(row[field] is None for field in ("consumer_id", "delivery_id", "lease_token", "claimed_at", "lease_until"))
+        assert row["last_delivery_id"] == delivery.delivery_id
+        assert row["last_consumer_id"] == "worker-a"
+
+
+@pytest.mark.asyncio
 async def test_extend_lease_is_capped_by_message_expiry() -> None:
     now = [utc_now()]
     async with SQLiteBroker(clock=lambda: now[0]) as broker:
@@ -240,6 +297,54 @@ async def test_extend_lease_is_capped_by_message_expiry() -> None:
         extended = await delivery.extend_lease(seconds=60)
         assert extended <= expires_at
         assert (expires_at - extended).total_seconds() < 0.001
+
+
+@pytest.mark.asyncio
+async def test_expired_delivery_ack_records_expiry_not_ack() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.increments: list[str] = []
+        async def increment(self, name, value=1, **labels): self.increments.append(name)  # type: ignore[no-untyped-def]
+        async def observe(self, name, value, **labels): pass  # type: ignore[no-untyped-def]
+
+    now = [utc_now()]
+    middleware, metrics = Middleware(), Recorder()
+    events: list[BrokerEvent] = []
+    middleware.add("event", events.append)
+    async with SQLiteBroker(clock=lambda: now[0], middleware=middleware, metrics=metrics) as broker:
+        await broker.submit(queue="jobs", payload={}, expires_at=now[0] + timedelta(seconds=1))
+        delivery = await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=10)).__anext__()
+        now[0] += timedelta(seconds=2)
+        assert await delivery.ack() is FinishOutcome.EXPIRED
+        stats = await broker.inspect("jobs")
+    assert stats.acked_total == 0 and stats.expired == 1
+    assert "acked_total" not in metrics.increments and "expired_total" in metrics.increments
+    assert any(item.name == "expired" for item in events)
+    assert not any(item.name == "ack" for item in events)
+
+
+@pytest.mark.asyncio
+async def test_worker_is_an_async_context_manager_and_rejects_zero_concurrency() -> None:
+    async with SQLiteBroker() as broker:
+        with pytest.raises(ValidationError):
+            broker.worker("jobs", lambda _: None, concurrency=0)
+        async with broker.worker("jobs", lambda _: None) as worker:
+            assert worker.concurrency == 1
+
+
+@pytest.mark.asyncio
+async def test_post_commit_hooks_and_metrics_failures_do_not_change_result() -> None:
+    class BrokenMetrics:
+        async def increment(self, *args, **kwargs): raise RuntimeError("metrics down")  # type: ignore[no-untyped-def]
+        async def observe(self, *args, **kwargs): raise RuntimeError("metrics down")  # type: ignore[no-untyped-def]
+
+    middleware = Middleware()
+    def broken_hook(*_): raise RuntimeError("hook down")  # type: ignore[no-untyped-def]
+    middleware.add("after_ack", broken_hook)
+    async with SQLiteBroker(middleware=middleware, metrics=BrokenMetrics()) as broker:
+        await broker.submit(queue="jobs", payload={})
+        await (await receive(broker)).ack()
+        assert (await broker.inspect("jobs")).acked_total == 1
 
 
 @pytest.mark.asyncio
@@ -315,6 +420,14 @@ async def test_invalid_payload_and_dedup_parameters_are_rejected() -> None:
             await broker.submit(queue="jobs", payload={}, dedup_key="x")
         with pytest.raises(ValidationError):
             await broker.submit(queue="jobs", payload={}, dedup_scope="s", dedup_key="x", dedup_ttl=timedelta())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ttl", [timedelta(), timedelta(milliseconds=-1)])
+async def test_explicit_invalid_dedup_ttl_never_falls_back_to_default(ttl: timedelta) -> None:
+    async with SQLiteBroker(default_dedup_ttl=timedelta(hours=1)) as broker:
+        with pytest.raises(ValidationError):
+            await broker.submit(queue="jobs", payload={}, dedup_scope="s", dedup_key="x", dedup_ttl=ttl)
 
 
 @pytest.mark.asyncio

@@ -4,8 +4,9 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from contextlib import suppress
 from typing import Any
+
+from typing_extensions import Self
 
 from .errors import ValidationError
 from .observability import metric
@@ -45,6 +46,13 @@ class TaskWorker:
         if self._tasks:
             await asyncio.gather(*self._tasks)
 
+    async def __aenter__(self) -> Self:
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.close()
+
     async def close(self) -> None:
         """停止新领取并等待当前 handler 完成与 ACK/Retry。"""
         self._closed = True
@@ -64,13 +72,12 @@ class TaskWorker:
             try:
                 started_at = time.perf_counter()
                 result = self._handler(delivery.message)
-                if hasattr(result, "__await__"):
+                if result is not None:
                     await result
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                with suppress(Exception):
-                    await delivery.retry(reason=f"{type(exc).__name__}: {exc}")
+            except Exception as exc:  # noqa: BLE001 - handler errors must be retried
+                await delivery.retry(reason=f"{type(exc).__name__}: {exc}")
             else:
                 await delivery.ack()
                 await metric(getattr(self._broker, "metrics", None), "processing_duration",

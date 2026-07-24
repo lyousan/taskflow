@@ -116,10 +116,15 @@ broker = RedisBroker(
 ```
 
 自定义 Store 直接接收完整的 `PreparedSubmission`，因此可以实现自己的原子准入语义。
+`batch_submit` 表示支持批量 API，`batch_atomic` 表示同一 Store 的整批事务 / Lua 脚本
+原子性。混合 queue profile 会分组执行，因此整次调用不承诺跨 profile 原子性。
 
 DLQ / EQ replay 默认 `reuse_dedup=True`，保留原 scope/key 与其记录。传入
 `reuse_dedup=False` 会移除原记录；同时提供新的 `dedup_scope`、`dedup_key` 和正数
 `dedup_ttl` 则会原子替换记录。目标 queue 的变化不会自动改写 dedup scope。
+
+`dedup_ttl=None` 才会回退到 Broker 的默认 TTL；显式传入零或负数 TTL 一律会被拒绝，
+不会被默认值覆盖。
 
 ## 精确 String Dedup
 

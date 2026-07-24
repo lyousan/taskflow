@@ -15,13 +15,15 @@ from ..capabilities import BackendCapabilities, DedupGuarantee, SubmissionCapabi
 from ..errors import BrokerClosedError, LeaseLostError, ValidationError
 from ..middleware import Middleware
 from ..naming import validate_persistent_name
-from ..observability import MetricsSink, event as emit_event, metric
+from ..observability import MetricsSink, metric
+from ..observability import event as emit_event
 from ..serialization import JsonSerializer, Serializer, SerializerRegistry
 from ..submission import PreparedSubmission
 from ..types import (
     ConsumerOptions,
     DeadLetter,
     ExpiredMessage,
+    FinishOutcome,
     MessageStatus,
     QueueStats,
     SubmitDecision,
@@ -45,6 +47,7 @@ class RedisBroker:
         distributed_consumers=True,
         high_throughput=True,
         batch_submit=True,
+        batch_atomic=True,
     )
 
     def __init__(self, redis: Any, *, namespace: str = "taskflow", default_max_attempts: int = 3,
@@ -212,7 +215,7 @@ class RedisBroker:
         self._validate_queue(queue)
         if (dedup_key is None) != (dedup_scope is None):
             raise ValidationError("dedup_key 与 dedup_scope 必须同时提供")
-        ttl = dedup_ttl or self._default_dedup_ttl
+        ttl = self._default_dedup_ttl if dedup_ttl is None else dedup_ttl
         if dedup_key is not None and (ttl is None or ttl.total_seconds() <= 0):
             raise ValidationError("启用去重时必须提供正数 dedup_ttl 或配置默认值")
         attempts = max_attempts if max_attempts is not None else self._default_max_attempts
@@ -269,7 +272,7 @@ class RedisBroker:
                options: ConsumerOptions | None = None) -> TaskWorker:
         """创建一个真正受 ``concurrency`` 限制的 Worker。"""
         selected = options or ConsumerOptions()
-        return TaskWorker(self, queue, handler, concurrency=concurrency or selected.concurrency, options=selected)
+        return TaskWorker(self, queue, handler, concurrency=concurrency if concurrency is not None else selected.concurrency, options=selected)
 
     async def run(self, queue: str, handler: Handler, *, concurrency: int | None = None,
                   options: ConsumerOptions | None = None) -> None:
@@ -314,7 +317,7 @@ class RedisBroker:
         return delivery
 
     async def _finish(self, delivery: RedisDelivery, action: str, reason: str | None = None,
-                      error: BaseException | None = None) -> None:
+                      error: BaseException | None = None) -> FinishOutcome:
         now = await self._now()
         queue, message_id = delivery.message.queue, delivery.message.id
         error_type = type(error).__name__ if error else ""
@@ -322,7 +325,7 @@ class RedisBroker:
             local status = redis.call('HGET', KEYS[1], 'status')
             local current = redis.call('HGET', KEYS[1], 'delivery_id')
             if status ~= 'leased' then
-              if current == ARGV[2] and redis.call('HGET', KEYS[1], 'last_action') == ARGV[1] then return 2 end
+              if redis.call('HGET', KEYS[1], 'last_delivery_id') == ARGV[2] and redis.call('HGET', KEYS[1], 'last_action') == ARGV[1] then return 2 end
               return 0
             end
             if current ~= ARGV[2] or redis.call('HGET', KEYS[1], 'lease_token') ~= ARGV[3] or tonumber(redis.call('HGET', KEYS[1], 'lease_until') or '0') <= tonumber(ARGV[4]) then return 0 end
@@ -330,20 +333,21 @@ class RedisBroker:
             local expires = tonumber(redis.call('HGET', KEYS[1], 'expires_at') or '0')
             if expires > 0 and expires <= tonumber(ARGV[4]) then
               redis.call('HSET', KEYS[1], 'status', 'expired', 'last_action', 'expired', 'expired_at', ARGV[4], 'status_at_expiry', 'leased', 'last_delivery_id', ARGV[2])
-              redis.call('XACK', KEYS[4], ARGV[8], entry); redis.call('XDEL', KEYS[4], entry); redis.call('ZREM', KEYS[2], ARGV[5]); redis.call('ZREM', KEYS[3], ARGV[5]); redis.call('ZREM', KEYS[8], ARGV[5]); redis.call('LPUSH', KEYS[5], ARGV[5]); return 1
+              redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until')
+              redis.call('XACK', KEYS[4], ARGV[8], entry); redis.call('XDEL', KEYS[4], entry); redis.call('ZREM', KEYS[2], ARGV[5]); redis.call('ZREM', KEYS[3], ARGV[5]); redis.call('ZREM', KEYS[8], ARGV[5]); redis.call('LPUSH', KEYS[5], ARGV[5]); return 3
             end
             local attempt = tonumber(redis.call('HGET', KEYS[1], 'attempt'))
             local max_attempts = tonumber(redis.call('HGET', KEYS[1], 'max_attempts'))
             redis.call('ZREM', KEYS[2], ARGV[5])
             if ARGV[1] == 'ack' then
-              redis.call('XACK', KEYS[4], ARGV[8], entry); redis.call('XDEL', KEYS[4], entry); redis.call('HSET', KEYS[1], 'status', 'acked', 'last_action', 'ack'); redis.call('ZREM', KEYS[3], ARGV[5]); redis.call('HINCRBY', KEYS[6], 'acked_total', 1)
+              redis.call('XACK', KEYS[4], ARGV[8], entry); redis.call('XDEL', KEYS[4], entry); redis.call('HSET', KEYS[1], 'status', 'acked', 'last_action', 'ack', 'last_delivery_id', ARGV[2]); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until'); redis.call('ZREM', KEYS[3], ARGV[5]); redis.call('HINCRBY', KEYS[6], 'acked_total', 1); return 4
             elseif ARGV[1] == 'retry' and attempt < max_attempts then
-              redis.call('XACK', KEYS[4], ARGV[8], entry); redis.call('XDEL', KEYS[4], entry); local new_entry = redis.call('XADD', KEYS[4], '*', 'message_id', ARGV[5], 'envelope', redis.call('HGET', KEYS[1], 'envelope')); redis.call('HSET', KEYS[1], 'status', 'ready', 'entry_id', new_entry, 'last_action', 'retry', 'last_reason', ARGV[6]); redis.call('ZADD', KEYS[8], ARGV[4], ARGV[5]); redis.call('HINCRBY', KEYS[6], 'retried_total', 1)
+              redis.call('XACK', KEYS[4], ARGV[8], entry); redis.call('XDEL', KEYS[4], entry); local new_entry = redis.call('XADD', KEYS[4], '*', 'message_id', ARGV[5], 'envelope', redis.call('HGET', KEYS[1], 'envelope')); redis.call('HSET', KEYS[1], 'status', 'ready', 'entry_id', new_entry, 'last_action', 'retry', 'last_reason', ARGV[6], 'last_delivery_id', ARGV[2]); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until'); redis.call('ZADD', KEYS[8], ARGV[4], ARGV[5]); redis.call('HINCRBY', KEYS[6], 'retried_total', 1); return 5
             else
               local source = ARGV[1] == 'reject' and 'reject' or 'retry_limit'
-              redis.call('XACK', KEYS[4], ARGV[8], entry); redis.call('XDEL', KEYS[4], entry); redis.call('HSET', KEYS[1], 'status', 'dead_lettered', 'last_action', ARGV[1], 'last_reason', ARGV[6], 'dead_source', source, 'failed_at', ARGV[4], 'error_type', ARGV[7])
-              redis.call('ZREM', KEYS[3], ARGV[5]); redis.call('LPUSH', KEYS[7], ARGV[5]); redis.call('HINCRBY', KEYS[6], 'dead_lettered_total', 1)
-            end; return 1
+              redis.call('XACK', KEYS[4], ARGV[8], entry); redis.call('XDEL', KEYS[4], entry); redis.call('HSET', KEYS[1], 'status', 'dead_lettered', 'last_action', ARGV[1], 'last_reason', ARGV[6], 'dead_source', source, 'failed_at', ARGV[4], 'error_type', ARGV[7], 'last_delivery_id', ARGV[2]); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until')
+              redis.call('ZREM', KEYS[3], ARGV[5]); redis.call('LPUSH', KEYS[7], ARGV[5]); redis.call('HINCRBY', KEYS[6], 'dead_lettered_total', 1); return 6
+            end
         """
         result = int(await self._redis.eval(script, 8, self._message_key(message_id), self._queue_key(queue, "leases"),
                                              self._queue_key(queue, "expiry"), self._queue_key(queue, "stream"),
@@ -352,10 +356,19 @@ class RedisBroker:
         if result == 0:
             await metric(self.metrics, "lease_lost_total", queue=queue)
             raise LeaseLostError("租约已经失效，不能终结当前投递")
-        await self.middleware.emit(f"after_{action}", delivery, reason)
-        if result == 1:
-            await metric(self.metrics, {"ack": "acked_total", "retry": "retried_total", "reject": "dead_lettered_total"}[action], queue=queue)
-            await emit_event(self.middleware, action, delivery.message, status=action, delivery=delivery, reason=reason, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+        if result == 2:
+            return FinishOutcome.IDEMPOTENT
+        outcome = {3: FinishOutcome.EXPIRED, 4: FinishOutcome.ACKED, 5: FinishOutcome.RETRIED, 6: FinishOutcome.DEAD_LETTERED}[result]
+        event_name, metric_name = {
+            FinishOutcome.EXPIRED: ("expired", "expired_total"),
+            FinishOutcome.ACKED: ("ack", "acked_total"),
+            FinishOutcome.RETRIED: ("retry", "retried_total"),
+            FinishOutcome.DEAD_LETTERED: ("dead_lettered", "dead_lettered_total"),
+        }[outcome]
+        await self.middleware.emit(f"after_{event_name}", delivery, reason)
+        await metric(self.metrics, metric_name, queue=queue)
+        await emit_event(self.middleware, event_name, delivery.message, status=outcome.value, delivery=delivery, reason=reason, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+        return outcome
 
     async def _extend(self, delivery: RedisDelivery, seconds: float | None) -> datetime:
         period = seconds if seconds is not None else delivery._lease_seconds
@@ -375,6 +388,7 @@ class RedisBroker:
               local entry = redis.call('HGET', KEYS[1], 'entry_id')
               redis.call('XACK', KEYS[3], ARGV[5], entry); redis.call('XDEL', KEYS[3], entry)
               redis.call('HSET', KEYS[1], 'status', 'expired', 'last_action', 'expired', 'expired_at', now, 'status_at_expiry', 'leased', 'last_delivery_id', ARGV[1])
+              redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until')
               redis.call('ZREM', KEYS[2], ARGV[4]); redis.call('ZREM', KEYS[4], ARGV[4]); redis.call('LPUSH', KEYS[5], ARGV[4]); return 0
             end
             redis.call('HSET', KEYS[1], 'lease_until', ARGV[3]); redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4]); return 1
@@ -442,6 +456,7 @@ class RedisBroker:
             local entry = redis.call('HGET', KEYS[1], 'entry_id')
             if entry and entry ~= '' then redis.call('XACK', KEYS[4], ARGV[2], entry); redis.call('XDEL', KEYS[4], entry) end
             redis.call('HSET', KEYS[1], 'status', 'expired', 'last_action', 'expired', 'expired_at', ARGV[1], 'status_at_expiry', status, 'last_delivery_id', redis.call('HGET', KEYS[1], 'delivery_id') or '')
+            redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until')
             redis.call('ZREM', KEYS[2], ARGV[3]); redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('ZREM', KEYS[6], ARGV[3]); redis.call('LPUSH', KEYS[5], ARGV[3]); return 1
         """
         reclaim_script = """
@@ -450,13 +465,13 @@ class RedisBroker:
             local expires = tonumber(redis.call('HGET', KEYS[1], 'expires_at') or '0')
             redis.call('XACK', KEYS[4], ARGV[2], entry); redis.call('XDEL', KEYS[4], entry); redis.call('ZREM', KEYS[2], ARGV[3])
             if expires > 0 and expires <= tonumber(ARGV[1]) then
-              redis.call('HSET', KEYS[1], 'status', 'expired', 'last_action', 'expired', 'expired_at', ARGV[1], 'status_at_expiry', 'leased', 'last_delivery_id', redis.call('HGET', KEYS[1], 'delivery_id') or ''); redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('LPUSH', KEYS[7], ARGV[3]); return 1
+              redis.call('HSET', KEYS[1], 'status', 'expired', 'last_action', 'expired', 'expired_at', ARGV[1], 'status_at_expiry', 'leased', 'last_delivery_id', redis.call('HGET', KEYS[1], 'delivery_id') or ''); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until'); redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('LPUSH', KEYS[7], ARGV[3]); return 1
             end
             local attempt = tonumber(redis.call('HGET', KEYS[1], 'attempt')); local maximum = tonumber(redis.call('HGET', KEYS[1], 'max_attempts'))
             if attempt >= maximum then
-              redis.call('HSET', KEYS[1], 'status', 'dead_lettered', 'dead_source', 'lease_timeout', 'last_action', 'lease_timeout'); redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('LPUSH', KEYS[5], ARGV[3]); redis.call('HINCRBY', KEYS[6], 'dead_lettered_total', 1)
+              redis.call('HSET', KEYS[1], 'status', 'dead_lettered', 'dead_source', 'lease_timeout', 'last_action', 'lease_timeout', 'last_delivery_id', redis.call('HGET', KEYS[1], 'delivery_id') or ''); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until'); redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('LPUSH', KEYS[5], ARGV[3]); redis.call('HINCRBY', KEYS[6], 'dead_lettered_total', 1)
             else
-              local next_entry = redis.call('XADD', KEYS[4], '*', 'message_id', ARGV[3], 'envelope', redis.call('HGET', KEYS[1], 'envelope')); redis.call('HSET', KEYS[1], 'status', 'ready', 'entry_id', next_entry, 'last_action', 'reclaimed'); redis.call('ZADD', KEYS[8], ARGV[1], ARGV[3]); redis.call('HINCRBY', KEYS[6], 'reclaimed_total', 1)
+              local next_entry = redis.call('XADD', KEYS[4], '*', 'message_id', ARGV[3], 'envelope', redis.call('HGET', KEYS[1], 'envelope')); redis.call('HSET', KEYS[1], 'status', 'ready', 'entry_id', next_entry, 'last_action', 'reclaimed', 'last_delivery_id', redis.call('HGET', KEYS[1], 'delivery_id') or ''); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until'); redis.call('ZADD', KEYS[8], ARGV[1], ARGV[3]); redis.call('HINCRBY', KEYS[6], 'reclaimed_total', 1)
             end; return 1
         """
         for message_id in await self._redis.zrangebyscore(self._queue_key(queue, "expiry"), "-inf", _timestamp(now)):
@@ -515,6 +530,7 @@ class RedisSubmissionStore:
         stores_original_message_id=False,
         atomic_submit=True,
         batch_submit=True,
+        batch_atomic=True,
     )
 
     def __init__(self, broker: RedisBroker | Any, *, namespace: str = "taskflow") -> None:
@@ -549,7 +565,7 @@ class RedisSubmissionStore:
               redis.call('HSET', KEYS[2], 'expired_at', ARGV[8], 'status_at_expiry', 'ready', 'last_delivery_id', '')
               redis.call('LPUSH', KEYS[5], ARGV[2])
             end
-            if ARGV[9] ~= '0' then redis.call('ZADD', KEYS[4], ARGV[9], ARGV[2]) end
+            if ARGV[6] == 'ready' and ARGV[9] ~= '0' then redis.call('ZADD', KEYS[4], ARGV[9], ARGV[2]) end
             redis.call('HINCRBY', KEYS[6], 'submitted_total', 1)
             return {1, ARGV[2], ARGV[3], entry}
             """, 7, dedup_key, self._broker._message_key(submission.message_id),
@@ -608,7 +624,7 @@ class RedisSubmissionStore:
                 end
                 redis.call('HSET', KEYS[key + 2], 'envelope', ARGV[arg + 3], 'queue', ARGV[arg + 4], 'status', ARGV[arg + 5], 'entry_id', entry, 'attempt', '0', 'max_attempts', ARGV[arg + 6], 'created_at', ARGV[arg + 7], 'expires_at', ARGV[arg + 8], 'serializer_name', ARGV[arg + 9], 'serializer_version', ARGV[arg + 10])
                 if ARGV[arg + 5] ~= 'ready' then redis.call('HSET', KEYS[key + 2], 'expired_at', ARGV[arg + 7], 'status_at_expiry', 'ready', 'last_delivery_id', ''); redis.call('LPUSH', KEYS[key + 5], ARGV[arg + 1]) end
-                if ARGV[arg + 8] ~= '0' then redis.call('ZADD', KEYS[key + 4], ARGV[arg + 8], ARGV[arg + 1]) end
+                if ARGV[arg + 5] == 'ready' and ARGV[arg + 8] ~= '0' then redis.call('ZADD', KEYS[key + 4], ARGV[arg + 8], ARGV[arg + 1]) end
                 redis.call('HINCRBY', KEYS[key + 6], 'submitted_total', 1)
                 table.insert(output, 1); table.insert(output, ARGV[arg + 1]); table.insert(output, ARGV[arg + 2]); table.insert(output, entry)
               end
@@ -636,6 +652,7 @@ class RedisStringDedupSubmissionStore(RedisSubmissionStore):
         stores_original_message_id=True,
         atomic_submit=True,
         batch_submit=True,
+        batch_atomic=True,
     )
 
     def _dedup_redis_key(self, submission: PreparedSubmission) -> str:
@@ -651,11 +668,11 @@ class RedisDelivery:
         self._broker, self._lease_token, self._lease_seconds = broker, token, (lease_until - claimed_at).total_seconds()
         self.message, self.delivery_id, self.consumer_id, self.attempt = message, delivery_id, consumer_id, attempt
         self.claimed_at, self.lease_until = claimed_at, lease_until
-    async def ack(self) -> None: await self._broker._finish(self, "ack")
-    async def retry(self, *, reason: str | None = None) -> None: await self._broker._finish(self, "retry", reason)
-    async def reject(self, *, reason: str, error: BaseException | None = None) -> None:
+    async def ack(self) -> FinishOutcome: return await self._broker._finish(self, "ack")
+    async def retry(self, *, reason: str | None = None) -> FinishOutcome: return await self._broker._finish(self, "retry", reason)
+    async def reject(self, *, reason: str, error: BaseException | None = None) -> FinishOutcome:
         if not reason: raise ValidationError("reject 必须提供非空 reason")
-        await self._broker._finish(self, "reject", reason, error)
+        return await self._broker._finish(self, "reject", reason, error)
     async def extend_lease(self, *, seconds: float | None = None) -> datetime:
         self.lease_until = await self._broker._extend(self, seconds); return self.lease_until
 
@@ -705,7 +722,11 @@ class RedisAdmin:
                       dedup_ttl: timedelta | None) -> tuple[TaskMessage, str, str, int, bool]:
         """返回新 envelope 的 dedup 元数据；scope 不随 queue 重写。"""
         has_override = dedup_scope is not None or dedup_key is not None or dedup_ttl is not None
-        old_redis_key = self._broker._dedup_key(message.dedup_scope, message.dedup_key) if message.dedup_key is not None else ""
+        if message.dedup_key is not None:
+            assert message.dedup_scope is not None
+            old_redis_key = self._broker._dedup_key(message.dedup_scope, message.dedup_key)
+        else:
+            old_redis_key = ""
         if reuse_dedup and has_override:
             raise ValidationError("reuse_dedup=True 时不能同时指定新的 dedup 参数")
         if reuse_dedup:
@@ -714,7 +735,7 @@ class RedisAdmin:
             raise ValidationError("dedup_scope 与 dedup_key 必须同时提供")
         if dedup_key is None:
             return replace(message, dedup_scope=None, dedup_key=None), old_redis_key, "", 0, False
-        ttl = dedup_ttl or self._broker._default_dedup_ttl
+        ttl = self._broker._default_dedup_ttl if dedup_ttl is None else dedup_ttl
         if ttl is None or ttl.total_seconds() <= 0:
             raise ValidationError("替换 dedup 时必须提供正数 dedup_ttl 或配置默认值")
         assert dedup_scope is not None

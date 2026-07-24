@@ -32,6 +32,16 @@ class SubmitDecision(str, Enum):
     PROBABLE_DUPLICATE = "probable_duplicate"
 
 
+class FinishOutcome(str, Enum):
+    """一次终结请求实际触发的状态迁移结果。"""
+
+    ACKED = "acked"
+    RETRIED = "retried"
+    DEAD_LETTERED = "dead_lettered"
+    EXPIRED = "expired"
+    IDEMPOTENT = "idempotent"
+
+
 @dataclass(frozen=True, slots=True)
 class TaskMessage:
     """不可变且 JSON 兼容的业务消息。"""

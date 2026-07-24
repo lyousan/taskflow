@@ -52,4 +52,17 @@ broker = RedisBroker.from_url("redis://127.0.0.1:6379/2")
 
 开发路线与版本验收标准见 [`docs/roadmap.md`](docs/roadmap.md)。
 
-运行测试：`pytest`。
+## 开发与 Release 验证
+
+Redis backend 是可选的运行时依赖；但完整测试、类型检查和 release CI 应安装两个 extra：
+
+```bash
+uv sync --extra dev --extra redis --locked
+uv run ruff check src tests
+uv run mypy src tests
+uv run pytest --cov=taskflow -q
+uv build
+```
+
+扩展开发者可从顶层导入 `TaskBroker`、`TaskConsumer`、`TaskDelivery` 与
+`SubmissionStore` Protocol。

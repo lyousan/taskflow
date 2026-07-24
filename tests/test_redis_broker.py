@@ -3,12 +3,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncGenerator
 from datetime import timedelta
 from uuid import uuid4
 
 import pytest
 
-from taskflow import ConsumerOptions, LeaseLostError, RedisBroker, RedisStringDedupSubmissionStore, RedisSubmissionStore, SubmitRequest, ValidationError
+from taskflow import (
+    ConsumerOptions,
+    FinishOutcome,
+    JsonSerializer,
+    LeaseLostError,
+    RedisBroker,
+    RedisStringDedupSubmissionStore,
+    RedisSubmissionStore,
+    SerializerRegistry,
+    SubmitRequest,
+    ValidationError,
+)
 from taskflow.types import utc_now
 
 pytest.importorskip("redis.asyncio")
@@ -35,7 +47,7 @@ async def clean(broker: RedisBroker) -> None:
 
 
 @pytest.fixture
-async def broker() -> RedisBroker:
+async def broker() -> AsyncGenerator[RedisBroker, None]:
     """为每个用例隔离 Redis namespace，并在结束后回收测试键。"""
 
     instance = RedisBroker.from_url(namespace=f"taskflow-test-{uuid4()}", pending_recovery_seconds=0.0)
@@ -69,6 +81,38 @@ async def test_submit_dedup_retry_ack_and_stats(broker: RedisBroker) -> None:
     await retried.ack()
     assert await broker._redis.zcard(broker._queue_key("jobs", "ready")) == 0
     assert (await broker.inspect("jobs")).acked_total == 1
+
+
+@pytest.mark.asyncio
+async def test_redis_terminal_operations_are_idempotent(broker: RedisBroker) -> None:
+    await broker.submit(queue="jobs", payload={})
+    acked = await receive(broker)
+    assert await acked.ack() is FinishOutcome.ACKED
+    assert await acked.ack() is FinishOutcome.IDEMPOTENT
+
+    await broker.submit(queue="jobs", payload={})
+    retried = await receive(broker)
+    assert await retried.retry(reason="temporary") is FinishOutcome.RETRIED
+    assert await retried.retry(reason="temporary") is FinishOutcome.IDEMPOTENT
+    await (await receive(broker)).ack()
+
+    await broker.submit(queue="jobs", payload={}, max_attempts=1)
+    limited = await receive(broker)
+    assert await limited.retry(reason="limit") is FinishOutcome.DEAD_LETTERED
+    assert await limited.retry(reason="limit") is FinishOutcome.IDEMPOTENT
+
+    await broker.submit(queue="jobs", payload={})
+    current = await receive(broker)
+    assert await current.reject(reason="bad") is FinishOutcome.DEAD_LETTERED
+    assert await current.reject(reason="bad") is FinishOutcome.IDEMPOTENT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ttl", [timedelta(), timedelta(milliseconds=-1)])
+async def test_explicit_invalid_dedup_ttl_never_falls_back_to_default(broker: RedisBroker, ttl: timedelta) -> None:
+    broker._default_dedup_ttl = timedelta(hours=1)
+    with pytest.raises(ValidationError):
+        await broker.submit(queue="jobs", payload={}, dedup_scope="s", dedup_key="x", dedup_ttl=ttl)
 
 
 @pytest.mark.asyncio
@@ -195,6 +239,22 @@ async def test_extend_lease_is_capped_by_message_expiry(broker: RedisBroker) -> 
 
 
 @pytest.mark.asyncio
+async def test_initial_expiry_and_expired_ack_keep_indexes_and_stats_consistent(broker: RedisBroker) -> None:
+    initial = await broker.submit(queue="jobs", payload={}, expires_at=utc_now() - timedelta(seconds=1))
+    assert await broker._redis.zscore(broker._queue_key("jobs", "expiry"), initial.message_id) is None
+
+    active = await broker.submit(queue="jobs", payload={}, expires_at=utc_now() + timedelta(seconds=1))
+    delivery = await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=2)).__anext__()
+    assert delivery.message.id == active.message_id
+    await asyncio.sleep(1.05)
+    await delivery.ack()
+    state = await broker._redis.hgetall(broker._message_key(active.message_id))
+    assert state["status"] == "expired"
+    assert int((await broker.inspect("jobs")).acked_total) == 0
+    assert all(field not in state for field in ("consumer_id", "delivery_id", "lease_token", "claimed_at", "lease_until"))
+
+
+@pytest.mark.asyncio
 async def test_queue_profiles_route_submissions_and_preserve_batch_order() -> None:
     namespace = f"taskflow-profile-{uuid4()}"
     instance = RedisBroker.from_url(
@@ -210,6 +270,7 @@ async def test_queue_profiles_route_submissions_and_preserve_batch_order() -> No
         assert instance.submission_capabilities("plain-jobs").dedup_guarantee.value == "none"
         assert instance.submission_capabilities("exact-jobs").dedup_guarantee.value == "exact"
         assert instance.submission_capabilities("exact-jobs").batch_submit
+        assert instance.submission_capabilities("exact-jobs").batch_atomic
         results = await instance.submit_many([
             SubmitRequest(queue="exact-jobs", payload={"n": 1}, dedup_scope="s", dedup_key="same", dedup_ttl=timedelta(minutes=1)),
             SubmitRequest(queue="plain-jobs", payload={"n": 2}),
@@ -228,3 +289,25 @@ def test_redis_namespace_must_be_a_safe_persistent_identifier() -> None:
     for namespace in ("", "with:colon", "has{tag}", "中文", "x" * 256):
         with pytest.raises(ValidationError, match="namespace"):
             RedisBroker(UnusedRedis(), namespace=namespace)
+
+
+@pytest.mark.asyncio
+async def test_redis_serializer_registry_decodes_historical_message() -> None:
+    namespace = f"taskflow-registry-{uuid4()}"
+    writer = RedisBroker.from_url(namespace=namespace, serializer=BinaryJsonSerializer())
+    await writer.start()
+    try:
+        await writer.submit(queue="jobs", payload={"binary": True})
+        reader = RedisBroker.from_url(
+            namespace=namespace,
+            serializer=JsonSerializer(),
+            serializer_registry=SerializerRegistry([BinaryJsonSerializer()]),
+        )
+        await reader.start()
+        try:
+            assert (await receive(reader)).message.payload == {"binary": True}
+        finally:
+            await reader.close()
+    finally:
+        await clean(writer)
+        await writer.close()

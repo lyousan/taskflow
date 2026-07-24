@@ -22,6 +22,7 @@ class BackendCapabilities:
     deduplication: bool = True
     lease_reclaim: bool = True
     batch_submit: bool = True
+    batch_atomic: bool = False
     transactional_submit: bool = True
     priority: bool = False
     partition_ordering: bool = False
@@ -38,3 +39,4 @@ class SubmissionCapabilities:
     stores_original_message_id: bool
     atomic_submit: bool
     batch_submit: bool
+    batch_atomic: bool = False

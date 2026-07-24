@@ -8,7 +8,13 @@ dependencies = ["aiosqlite>=0.20", "typing-extensions>=4.4"]
 
 [project.optional-dependencies]
 redis = ["redis>=5.0"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.8",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -20,6 +26,9 @@ packages = ["src/taskflow"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.coverage.report]
+fail_under = 85
 
 [tool.ruff.lint.per-file-ignores]
 "src/taskflow/broker/sqlite.py" = ["PYI019"]
