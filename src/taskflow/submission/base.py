@@ -25,6 +25,7 @@ class PreparedSubmission:
     max_attempts: int
     serializer_name: str
     serializer_version: str
+    available_at_ms: int | None = None
 
 
 class CallbackSubmissionStore:

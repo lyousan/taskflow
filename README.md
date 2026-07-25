@@ -1,7 +1,8 @@
 # Taskflow
 
-Taskflow 是独立、可嵌入、异步优先的 Python 任务消息框架。v0.1 提供可靠的
-至少一次投递、显式 ACK、立即重试、租约回收、DLQ、EQ 与精确提交去重。
+Taskflow 是独立、可嵌入、异步优先的 Python 任务消息框架。v0.2 提供可靠的
+至少一次投递、显式 ACK、延迟重试、租约回收、DLQ、EQ 与精确提交去重，以及可直接运行
+异步 handler 的高层 Worker。
 
 内置 `SQLiteBroker` 与 `RedisBroker`。SQLite 适用于本地脚本、测试和 CI，
 不适合作为高吞吐、分布式生产队列；Redis 适用于多进程或多实例消费者。
@@ -10,7 +11,8 @@ Redis backend 使用 Streams 与 Consumer Group；主流状态变迁由 Lua 原�
 ```python
 import asyncio
 from datetime import timedelta
-from taskflow import ConsumerOptions, SQLiteBroker
+from taskflow import SQLiteBroker
+from taskflow.retry import ExponentialBackoff, RetryPolicy
 
 
 async def main() -> None:
@@ -22,33 +24,56 @@ async def main() -> None:
             dedup_key="example.com:/",
             dedup_ttl=timedelta(days=7),
         )
-        async with broker.consumer("crawl.fetch", options=ConsumerOptions(lease_seconds=60)) as consumer:
-            delivery = await anext(consumer)
-            # 在业务副作用成功后再确认，处理函数必须保持幂等。
-            await delivery.ack()
+        async def fetch(message):
+            # 在这里完成可重试且幂等的业务副作用。
+            print(message.payload["url"])
+
+        async with broker.worker(
+            "crawl.fetch", fetch, concurrency=10,
+            retry_policy=RetryPolicy(
+                max_attempts=5,
+                backoff=ExponentialBackoff(initial=1, maximum=60, jitter=True),
+            ),
+        ) as worker:
+            await worker.run()
 
 
 asyncio.run(main())
 ```
 
-Redis 需要安装额外依赖：`pip install 'taskflow[redis]'`。使用实例可通过 URL 创建：
+Redis 需要安装额外依赖：`pip install 'taskflow[redis]'`。使用实例可通过 URL 创建；
+Worker API 与 SQLite 完全相同，适合多进程或多实例消费者：
 
 ```python
 from taskflow import RedisBroker
 
-broker = RedisBroker.from_url("redis://127.0.0.1:6379/2")
+async def main() -> None:
+    broker = RedisBroker.from_url("redis://127.0.0.1:6379/2")
+    async with broker:
+        async with broker.worker("emails", handle_email, concurrency=20) as worker:
+            await worker.run()
+
+asyncio.run(main())
 ```
+
+低层 `consumer()` / `Delivery` API 仍然可用，适合需要业务自行决定终结结果的场景：只应在
+副作用成功后 `ack()`；临时错误使用 `retry()`，不可恢复错误使用 `reject()`。
 
 ## 关键语义
 
 - Taskflow 承诺 at-least-once 投递。worker 在 `ack()` 前崩溃时，消息会在租约
   到期后再次投递，业务处理必须幂等。
-- `retry()` 是立即重投；达到 `max_attempts` 后进入 DLQ。延迟重试属于 v0.2。
+- `retry(delay=...)` 与 `submit(delay=...)` 会原子地进入持久化的 `DELAYED` 状态；到期后
+  maintenance 在 claim/inspect 时幂等地将其变为 READY。延迟等待期间进程重启不会丢失消息。
+- `RetryPolicy` 的 attempt 从 1 开始计数，`max_attempts=3` 表示 handler 至多执行三次。
+  `RetryableError` 会按策略重试，`RejectMessage` 会直接进入 DLQ；其他异常由
+  `retry_on` / `reject_on` 决定。Worker 在 handler 运行时自动 heartbeat lease。
 - 同一个 Delivery 的重复终结操作是幂等的；旧 lease 的迟到操作会抛出
   `LeaseLostError`。
 - 去重只在提交阶段发生。启用去重必须同时传入 `dedup_scope`、`dedup_key` 和
   正数 `dedup_ttl`（或配置 broker 的默认 TTL）。
-- `expires_at` 与 dedup TTL 相互独立。到期消息不会交给业务 handler，会进入 EQ。
+- `expires_at` 与 dedup TTL 相互独立。包括 DELAYED 在内的到期消息不会交给业务 handler，
+  会进入 EQ。
 
 开发路线与版本验收标准见 [`docs/roadmap.md`](docs/roadmap.md)。
 

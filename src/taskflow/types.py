@@ -18,6 +18,7 @@ class MessageStatus(str, Enum):
     """消息在 Taskflow 中的投递状态。"""
 
     READY = "ready"
+    DELAYED = "delayed"
     LEASED = "leased"
     ACKED = "acked"
     DEAD_LETTERED = "dead_lettered"
@@ -57,6 +58,7 @@ class TaskMessage:
     created_at: datetime = field(default_factory=utc_now)
     expires_at: datetime | None = None
     max_attempts: int = 3
+    available_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +75,7 @@ class SubmitRequest:
     max_attempts: int | None = None
     workflow_id: str | None = None
     parent_id: str | None = None
+    delay: timedelta | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +114,7 @@ class QueueStats:
     retried_total: int
     reclaimed_total: int
     dead_lettered_total: int
+    delayed: int = 0
 
 
 @dataclass(frozen=True, slots=True)

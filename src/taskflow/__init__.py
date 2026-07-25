@@ -10,12 +10,15 @@ from .capabilities import BackendCapabilities, DedupGuarantee, SubmissionCapabil
 from .errors import (
     BrokerClosedError,
     LeaseLostError,
+    RejectMessage,
+    RetryableError,
     TaskflowError,
     UnsupportedCapabilityError,
     ValidationError,
 )
 from .observability import BrokerEvent, MetricsSink
 from .protocols import SubmissionStore, TaskBroker, TaskConsumer, TaskDelivery
+from .retry import ExponentialBackoff, FixedBackoff, ImmediateBackoff, RetryPolicy
 from .serialization import JsonSerializer, Serializer, SerializerRegistry
 from .types import (
     ConsumerOptions,
@@ -39,7 +42,10 @@ __all__ = [
     "DeadLetter",
     "DedupGuarantee",
     "ExpiredMessage",
+    "ExponentialBackoff",
     "FinishOutcome",
+    "FixedBackoff",
+    "ImmediateBackoff",
     "JsonSerializer",
     "LeaseLostError",
     "MessageStatus",
@@ -48,6 +54,9 @@ __all__ = [
     "RedisBroker",
     "RedisStringDedupSubmissionStore",
     "RedisSubmissionStore",
+    "RejectMessage",
+    "RetryPolicy",
+    "RetryableError",
     "SQLiteBroker",
     "SQLiteSubmissionStore",
     "Serializer",

@@ -1,6 +1,6 @@
 # Redis 消息生命周期设计
 
-本文补充 [PRD](PRD.md) 的 Redis Streams backend 设计，说明 v0.1 中 submit、claim、ack、retry、reject、lease reclaim 与过期队列（EQ）的状态和原子边界。
+本文补充 [PRD](PRD.md) 的 Redis Streams backend 设计，说明 v0.1 中 submit、claim、ack、retry、reject、lease reclaim 与过期队列（EQ）的状态和原子边界。v0.2 额外支持 `DELAYED`：延迟提交和 `retry(delay=...)` 仅写入 delayed Sorted Set；`maintain()` 到期后以 Lua 原子地 XADD 新 entry 并转为 READY。延迟消息仍保留 expiry 索引，因而过期后绝不重新投递。
 
 ## Redis 数据模型
 

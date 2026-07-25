@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import AsyncGenerator
 from datetime import timedelta
 from uuid import uuid4
@@ -17,25 +16,17 @@ from taskflow import (
     RedisBroker,
     RedisStringDedupSubmissionStore,
     RedisSubmissionStore,
+    RejectMessage,
+    RetryableError,
+    RetryPolicy,
     SerializerRegistry,
     SubmitRequest,
     ValidationError,
 )
 from taskflow.types import utc_now
+from tests.support import BinaryJsonSerializer
 
 pytest.importorskip("redis.asyncio")
-
-
-class BinaryJsonSerializer:
-    name = "binary-json"
-    version = "7"
-
-    def dumps(self, value: object) -> bytes:
-        return b"\xff" + json.dumps(value, separators=(",", ":")).encode()
-
-    def loads(self, payload: bytes) -> object:
-        assert payload.startswith(b"\xff")
-        return json.loads(payload[1:].decode())
 
 
 async def clean(broker: RedisBroker) -> None:
@@ -105,6 +96,119 @@ async def test_redis_terminal_operations_are_idempotent(broker: RedisBroker) -> 
     current = await receive(broker)
     assert await current.reject(reason="bad") is FinishOutcome.DEAD_LETTERED
     assert await current.reject(reason="bad") is FinishOutcome.IDEMPOTENT
+
+
+@pytest.mark.asyncio
+async def test_delayed_submit_and_retry_are_not_claimed_early(broker: RedisBroker) -> None:
+    submitted = await broker.submit(queue="jobs", payload={}, delay=timedelta(milliseconds=40))
+    assert (await broker.inspect("jobs")).delayed == 1
+    assert await broker._redis.hget(broker._message_key(submitted.message_id), "status") == "delayed"
+    await asyncio.sleep(0.05)
+    delivery = await receive(broker)
+    assert delivery.message.id == submitted.message_id
+    await delivery.retry(reason="temporary", delay=timedelta(milliseconds=40))
+    assert (await broker.inspect("jobs")).delayed == 1
+    await asyncio.sleep(0.05)
+    retried = await receive(broker)
+    assert retried.attempt == 2
+    await retried.ack()
+
+
+@pytest.mark.asyncio
+async def test_delayed_message_survives_redis_restart() -> None:
+    namespace = f"taskflow-delayed-restart-{uuid4()}"
+    first = RedisBroker.from_url(namespace=namespace)
+    await first.start()
+    try:
+        submitted = await first.submit(queue="jobs", payload={}, delay=timedelta(milliseconds=40))
+        await first.close()
+        restarted = RedisBroker.from_url(namespace=namespace)
+        await restarted.start()
+        try:
+            await asyncio.sleep(0.05)
+            delivery = await receive(restarted)
+            assert delivery.message.id == submitted.message_id
+            await delivery.ack()
+        finally:
+            await clean(restarted)
+            await restarted.close()
+    finally:
+        await first.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_worker_concurrency_policy_and_heartbeat(broker: RedisBroker) -> None:
+    active = 0
+    maximum = 0
+    retry_calls = 0
+
+    async def handler(message) -> None:
+        nonlocal active, maximum, retry_calls
+        active += 1
+        maximum = max(maximum, active)
+        kind = message.payload["kind"]
+        if kind == "retry" and retry_calls == 0:
+            retry_calls += 1
+            active -= 1
+            raise RetryableError("temporary")
+        if kind == "reject":
+            active -= 1
+            raise RejectMessage("invalid")
+        if kind == "long":
+            await asyncio.sleep(0.25)
+        active -= 1
+
+    worker = broker.worker(
+        "jobs", handler, concurrency=2,
+        options=ConsumerOptions(lease_seconds=0.1), heartbeat_seconds=0.02,
+        retry_policy=RetryPolicy.fixed(delay=0.01, max_attempts=3),
+    )
+    await worker.start()
+    for kind in ("retry", "reject", "long"):
+        await broker.submit(queue="jobs", payload={"kind": kind})
+    stats = await broker.inspect("jobs")
+    for _ in range(200):
+        stats = await broker.inspect("jobs")
+        if stats.acked_total == 2 and stats.dead_letters == 1:
+            break
+        await asyncio.sleep(0.005)
+    await worker.close()
+    letters = await broker.admin.list_dead_letters("jobs")
+    assert maximum <= 2 and retry_calls == 1
+    assert stats.acked_total == 2 and len(letters) == 1
+    assert letters[0].source == "reject"
+
+
+@pytest.mark.asyncio
+async def test_redis_worker_cancellation_reclaims_delivery(broker: RedisBroker) -> None:
+    started = asyncio.Event()
+
+    async def handler(_message) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    runner = asyncio.create_task(
+        broker.run("jobs", handler, options=ConsumerOptions(lease_seconds=0.01)))
+    await broker.submit(queue="jobs", payload={})
+    await started.wait()
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+    await asyncio.sleep(0.02)
+    recovered = await receive(broker)
+    assert recovered.attempt == 2
+    await recovered.ack()
+
+
+@pytest.mark.asyncio
+async def test_redis_delayed_message_expiring_before_due_goes_to_eq(broker: RedisBroker) -> None:
+    submitted = await broker.submit(queue="jobs", payload={}, delay=timedelta(milliseconds=40),
+                                    expires_at=utc_now() + timedelta(milliseconds=10))
+    await asyncio.sleep(0.05)
+    stats = await broker.inspect("jobs")
+    assert stats.ready == 0 and stats.delayed == 0 and stats.expired == 1
+    assert any(item.message.id == submitted.message_id
+               for item in await broker.admin.list_expired("jobs"))
 
 
 @pytest.mark.asyncio

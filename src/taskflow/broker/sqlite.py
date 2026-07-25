@@ -3,13 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import traceback as traceback_module
-import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import AbstractAsyncContextManager
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import aiosqlite
 
@@ -19,6 +17,8 @@ from ..middleware import Middleware
 from ..naming import validate_persistent_name
 from ..observability import MetricsSink, metric
 from ..observability import event as emit_event
+from ..protocols import TaskBroker
+from ..retry import RetryPolicy
 from ..serialization import JsonSerializer, Serializer, SerializerRegistry
 from ..submission import PreparedSubmission
 from ..types import (
@@ -35,29 +35,12 @@ from ..types import (
     utc_now,
 )
 from ..worker import Handler, TaskWorker
+from ._time import datetime_from_timestamp as _datetime
+from ._time import new_id as _new_id
+from ._time import timestamp as _timestamp
+from .sqlite_components import SQLiteConsumer, SQLiteDelivery
 
 BrokerT = TypeVar("BrokerT", bound="SQLiteBroker")
-ConsumerT = TypeVar("ConsumerT", bound="SQLiteConsumer")
-
-
-def _timestamp(value: datetime) -> float:
-    """统一将时间保存为 UTC epoch 秒。"""
-
-    if value.tzinfo is None:
-        raise ValidationError("时间必须带有时区，且建议使用 UTC")
-    return value.astimezone(timezone.utc).timestamp()
-
-
-def _datetime(value: float | None) -> datetime | None:
-    """将数据库时间恢复为 UTC datetime。"""
-
-    return None if value is None else datetime.fromtimestamp(value, timezone.utc)
-
-
-def _new_id() -> str:
-    """生成无外部依赖且适合任务标识的 UUID。"""
-
-    return str(uuid.uuid4())
 
 
 class SQLiteBroker:
@@ -117,7 +100,7 @@ class SQLiteBroker:
                 id TEXT PRIMARY KEY, queue TEXT NOT NULL, envelope BLOB NOT NULL,
                 serializer_name TEXT NOT NULL DEFAULT 'json', serializer_version TEXT NOT NULL DEFAULT '1',
                 status TEXT NOT NULL, attempt INTEGER NOT NULL, max_attempts INTEGER NOT NULL,
-                created_at REAL NOT NULL, expires_at REAL, consumer_id TEXT,
+                created_at REAL NOT NULL, available_at REAL, expires_at REAL, consumer_id TEXT,
                 delivery_id TEXT, lease_token TEXT, claimed_at REAL, lease_until REAL,
                 last_delivery_id TEXT, last_consumer_id TEXT,
                 last_action TEXT, last_reason TEXT
@@ -153,6 +136,8 @@ class SQLiteBroker:
             await self._connection.execute("ALTER TABLE messages ADD COLUMN last_delivery_id TEXT")
         if "last_consumer_id" not in columns:
             await self._connection.execute("ALTER TABLE messages ADD COLUMN last_consumer_id TEXT")
+        if "available_at" not in columns:
+            await self._connection.execute("ALTER TABLE messages ADD COLUMN available_at REAL")
         await self._connection.commit()
 
     async def start(self) -> None:
@@ -233,6 +218,7 @@ class SQLiteBroker:
             "metadata": dict(message.metadata), "dedup_key": message.dedup_key,
             "dedup_scope": message.dedup_scope, "workflow_id": message.workflow_id,
             "parent_id": message.parent_id, "created_at": _timestamp(message.created_at),
+            "available_at": _timestamp(message.available_at) if message.available_at else None,
             "expires_at": _timestamp(message.expires_at) if message.expires_at else None,
             "max_attempts": message.max_attempts,
         })
@@ -245,17 +231,18 @@ class SQLiteBroker:
             id=data["id"], queue=data["queue"], payload=data["payload"], metadata=data["metadata"],
             dedup_key=data["dedup_key"], dedup_scope=data["dedup_scope"], workflow_id=data["workflow_id"],
             parent_id=data["parent_id"], created_at=_datetime(data["created_at"]) or utc_now(),
+            available_at=_datetime(data.get("available_at")),
             expires_at=_datetime(data["expires_at"]), max_attempts=data["max_attempts"],
         )
 
     async def submit(self, *, queue: str, payload: Any, metadata: Mapping[str, Any] | None = None,
                      dedup_key: str | None = None, dedup_scope: str | None = None,
-                     dedup_ttl: timedelta | None = None, expires_at: datetime | None = None,
+                     dedup_ttl: timedelta | None = None, delay: timedelta | None = None, expires_at: datetime | None = None,
                      max_attempts: int | None = None, workflow_id: str | None = None,
                      parent_id: str | None = None) -> SubmitResult:
         """构造完整 PreparedSubmission 并委托 SubmissionStore 进入原子边界。"""
         prepared, message = self._prepare_submission(queue=queue, payload=payload, metadata=metadata,
-            dedup_key=dedup_key, dedup_scope=dedup_scope, dedup_ttl=dedup_ttl,
+            dedup_key=dedup_key, dedup_scope=dedup_scope, dedup_ttl=dedup_ttl, delay=delay,
             expires_at=expires_at, max_attempts=max_attempts, workflow_id=workflow_id, parent_id=parent_id)
         await self.middleware.emit("before_submit", message)
         result = await self._submission_store_for(queue).submit(prepared)
@@ -270,7 +257,7 @@ class SQLiteBroker:
 
     def _prepare_submission(self, *, queue: str, payload: Any, metadata: Mapping[str, Any] | None = None,
                      dedup_key: str | None = None, dedup_scope: str | None = None,
-                     dedup_ttl: timedelta | None = None, expires_at: datetime | None = None,
+                     dedup_ttl: timedelta | None = None, delay: timedelta | None = None, expires_at: datetime | None = None,
                      max_attempts: int | None = None, workflow_id: str | None = None,
                      parent_id: str | None = None) -> tuple[PreparedSubmission, TaskMessage]:
         """校验请求、生成 ID 并序列化；不在此处执行持久化。"""
@@ -285,25 +272,31 @@ class SQLiteBroker:
         if attempts < 1:
             raise ValidationError("max_attempts 必须大于等于 1")
         now = self._now()
+        if delay is not None and delay.total_seconds() < 0:
+            raise ValidationError("delay 不能为负数")
+        available_at = now + delay if delay and delay.total_seconds() > 0 else None
         if expires_at is not None and _timestamp(expires_at) <= _timestamp(now):
             # 已过期消息仍可审计，但不应先作为 READY 出现。
             initial_status = MessageStatus.EXPIRED
+        elif available_at is not None:
+            initial_status = MessageStatus.DELAYED
         else:
             initial_status = MessageStatus.READY
         message = TaskMessage(self._id_factory(), queue, payload, metadata or {}, dedup_key, dedup_scope,
-                              workflow_id, parent_id, now, expires_at, attempts)
+                              workflow_id, parent_id, now, expires_at, attempts, available_at)
         envelope = self._message_json(message)
         prepared = PreparedSubmission(message.id, queue, envelope, initial_status.value, now,
             int(_timestamp(expires_at) * 1000) if expires_at else None, dedup_scope, dedup_key,
             int(ttl.total_seconds() * 1000) if ttl else None, attempts,
-            self._serializer.name, self._serializer.version)
+            self._serializer.name, self._serializer.version,
+            int(_timestamp(available_at) * 1000) if available_at else None)
         return prepared, message
 
     async def submit_many(self, messages: list[SubmitRequest]) -> list[SubmitResult]:
         """按输入顺序提交一组请求；每项都保留独立、确定的提交结果。"""
 
         prepared_messages = [self._prepare_submission(queue=request.queue, payload=request.payload, metadata=request.metadata,
-            dedup_key=request.dedup_key, dedup_scope=request.dedup_scope, dedup_ttl=request.dedup_ttl,
+            dedup_key=request.dedup_key, dedup_scope=request.dedup_scope, dedup_ttl=request.dedup_ttl, delay=request.delay,
             expires_at=request.expires_at, max_attempts=request.max_attempts,
             workflow_id=request.workflow_id, parent_id=request.parent_id) for request in messages]
         for _, message in prepared_messages:
@@ -337,15 +330,22 @@ class SQLiteBroker:
         return SQLiteConsumer(self, queue, consumer_id or self._id_factory(), selected)
 
     def worker(self, queue: str, handler: Handler, *, concurrency: int | None = None,
-               options: ConsumerOptions | None = None) -> TaskWorker:
+               consumer_id: str | None = None, options: ConsumerOptions | None = None,
+               retry_policy: RetryPolicy | None = None, heartbeat_seconds: float | None = None) -> TaskWorker:
         """创建一个真正受 ``concurrency`` 限制的 Worker。"""
         selected = options or ConsumerOptions()
-        return TaskWorker(self, queue, handler, concurrency=concurrency if concurrency is not None else selected.concurrency, options=selected)
+        return TaskWorker(cast(TaskBroker, self), queue, handler, concurrency=concurrency if concurrency is not None else selected.concurrency,
+                          consumer_id=consumer_id, options=selected, retry_policy=retry_policy,
+                          heartbeat_seconds=heartbeat_seconds)
 
     async def run(self, queue: str, handler: Handler, *, concurrency: int | None = None,
-                  options: ConsumerOptions | None = None) -> None:
+                  consumer_id: str | None = None, options: ConsumerOptions | None = None,
+                  retry_policy: RetryPolicy | None = None,
+                  heartbeat_seconds: float | None = None) -> None:
         """运行 Worker，直到调用方取消任务或调用 Worker.close()。"""
-        await self.worker(queue, handler, concurrency=concurrency, options=options).run()
+        await self.worker(queue, handler, concurrency=concurrency, consumer_id=consumer_id,
+                          options=options, retry_policy=retry_policy,
+                          heartbeat_seconds=heartbeat_seconds).run()
 
     async def _claim(self, queue: str, consumer_id: str, lease_seconds: float) -> SQLiteDelivery | None:
         await self.start()
@@ -405,10 +405,15 @@ class SQLiteBroker:
         """在事务中回收超时租约，并把所有已过期消息移入 EQ。"""
 
         predicate, params = ("", []) if queue is None else (" AND queue=?", [queue])
-        expired = await (await cursor.execute("SELECT id, status, attempt FROM messages WHERE status IN (?, ?) AND expires_at IS NOT NULL AND expires_at<=?" + predicate,
-                                              [MessageStatus.READY.value, MessageStatus.LEASED.value, _timestamp(now), *params])).fetchall()
+        expired = await (await cursor.execute("SELECT id, status, attempt FROM messages WHERE status IN (?, ?, ?) AND expires_at IS NOT NULL AND expires_at<=?" + predicate,
+                                              [MessageStatus.READY.value, MessageStatus.DELAYED.value, MessageStatus.LEASED.value, _timestamp(now), *params])).fetchall()
         for row in expired:
             await self._expire(cursor, row["id"], now, MessageStatus(row["status"]), row["attempt"])
+        due = await (await cursor.execute("SELECT id FROM messages WHERE status=? AND available_at IS NOT NULL AND available_at<=?" + predicate,
+                                          [MessageStatus.DELAYED.value, _timestamp(now), *params])).fetchall()
+        for row in due:
+            await cursor.execute("UPDATE messages SET status=?, available_at=NULL, last_action='due' WHERE id=?",
+                                 (MessageStatus.READY.value, row["id"]))
         leases = await (await cursor.execute("SELECT * FROM messages WHERE status=? AND lease_until<=?" + predicate,
                                              [MessageStatus.LEASED.value, _timestamp(now), *params])).fetchall()
         for row in leases:
@@ -418,7 +423,7 @@ class SQLiteBroker:
                 await cursor.execute("UPDATE messages SET status=?, last_delivery_id=delivery_id, last_consumer_id=consumer_id, consumer_id=NULL, delivery_id=NULL, lease_token=NULL, claimed_at=NULL, lease_until=NULL, last_action='reclaimed', last_reason=? WHERE id=?",
                                (MessageStatus.READY.value, "租约超时", row["id"]))
                 await self._counter(cursor, row["queue"], "reclaimed_total")
-        return sum(1 for _ in expired) + sum(1 for _ in leases)
+        return sum(1 for _ in expired) + sum(1 for _ in due) + sum(1 for _ in leases)
 
     async def maintain(self, queue: str | None = None) -> int:
         """按需运行维护；生产部署可周期性调用此方法。"""
@@ -439,7 +444,8 @@ class SQLiteBroker:
                 raise
 
     async def _finish(self, delivery: SQLiteDelivery, action: str, reason: str | None = None,
-                      error: BaseException | None = None) -> FinishOutcome:
+                      error: BaseException | None = None, delay: timedelta | None = None,
+                      max_attempts: int | None = None) -> FinishOutcome:
         await self.start()
         now = self._now()
         async with self._lock:
@@ -465,12 +471,20 @@ class SQLiteBroker:
                     await self._counter(cursor, row["queue"], "acked_total")
                     outcome = FinishOutcome.ACKED
                 elif action == "retry":
-                    if row["attempt"] >= row["max_attempts"]:
+                    if delay is not None and delay.total_seconds() < 0:
+                        raise ValidationError("delay 不能为负数")
+                    limit = (min(row["max_attempts"], max_attempts)
+                             if max_attempts is not None else row["max_attempts"])
+                    if limit < 1:
+                        raise ValidationError("max_attempts 必须大于等于 1")
+                    if row["attempt"] >= limit:
                         await self._dead_letter(cursor, row, now, "retry_limit", reason, last_action="retry")
                         outcome = FinishOutcome.DEAD_LETTERED
                     else:
-                        await cursor.execute("UPDATE messages SET status=?, last_delivery_id=delivery_id, last_consumer_id=consumer_id, consumer_id=NULL, delivery_id=NULL, lease_token=NULL, claimed_at=NULL, lease_until=NULL, last_action=?, last_reason=? WHERE id=?",
-                                       (MessageStatus.READY.value, action, reason, row["id"]))
+                        available_at = now + delay if delay and delay.total_seconds() > 0 else None
+                        await cursor.execute("UPDATE messages SET status=?, available_at=?, last_delivery_id=delivery_id, last_consumer_id=consumer_id, consumer_id=NULL, delivery_id=NULL, lease_token=NULL, claimed_at=NULL, lease_until=NULL, last_action=?, last_reason=? WHERE id=?",
+                                       ((MessageStatus.DELAYED if available_at else MessageStatus.READY).value,
+                                        _timestamp(available_at) if available_at else None, action, reason, row["id"]))
                         await self._counter(cursor, row["queue"], "retried_total")
                         outcome = FinishOutcome.RETRIED
                 else:
@@ -543,13 +557,12 @@ class SQLiteBroker:
             dead_row = await (await cursor.execute("SELECT COUNT(*) FROM dead_letters WHERE queue=?", (queue,))).fetchone()
             expired_row = await (await cursor.execute("SELECT COUNT(*) FROM expired_messages WHERE queue=?", (queue,))).fetchone()
             assert dead_row is not None and expired_row is not None
-            ready, leased = await count(MessageStatus.READY), await count(MessageStatus.LEASED)
+            ready, leased, delayed = await count(MessageStatus.READY), await count(MessageStatus.LEASED), await count(MessageStatus.DELAYED)
             await metric(self.metrics, "queue_ready", float(ready), queue=queue)
             await metric(self.metrics, "queue_leased", float(leased), queue=queue)
-            return QueueStats(queue, ready, leased,
-                              dead_row[0], expired_row[0],
+            return QueueStats(queue, ready, leased, dead_row[0], expired_row[0],
                               _datetime(earliest), values["submitted_total"], values["acked_total"], values["retried_total"],
-                              values["reclaimed_total"], values["dead_lettered_total"])
+                              values["reclaimed_total"], values["dead_lettered_total"], delayed)
 
 
 class SQLiteSubmissionStore:
@@ -592,11 +605,12 @@ class SQLiteSubmissionStore:
                 await cursor.execute("""
                     INSERT INTO messages (
                         id, queue, envelope, serializer_name, serializer_version, status, attempt,
-                        max_attempts, created_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                        max_attempts, created_at, available_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                     """, (submission.message_id, submission.queue, submission.envelope,
                         submission.serializer_name, submission.serializer_version, submission.status,
                         submission.max_attempts, _timestamp(submission.created_at),
+                        submission.available_at_ms / 1000 if submission.available_at_ms is not None else None,
                         submission.expires_at_ms / 1000 if submission.expires_at_ms is not None else None))
                 await self._broker._counter(cursor, submission.queue, "submitted_total")
                 if submission.status == MessageStatus.EXPIRED.value:
@@ -631,7 +645,7 @@ class SQLiteSubmissionStore:
                             results.append(SubmitResult(existing["message_id"], False, SubmitDecision.DUPLICATE, existing["message_id"], dedup_expires_at=_datetime(existing["expires_at"])))
                             continue
                         await cursor.execute("INSERT INTO dedup_records VALUES (?, ?, ?, ?)", (submission.dedup_scope, submission.dedup_key, submission.message_id, _timestamp(now + timedelta(milliseconds=submission.dedup_ttl_ms))))
-                    await cursor.execute("INSERT INTO messages (id, queue, envelope, serializer_name, serializer_version, status, attempt, max_attempts, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)", (submission.message_id, submission.queue, submission.envelope, submission.serializer_name, submission.serializer_version, submission.status, submission.max_attempts, _timestamp(now), submission.expires_at_ms / 1000 if submission.expires_at_ms is not None else None))
+                    await cursor.execute("INSERT INTO messages (id, queue, envelope, serializer_name, serializer_version, status, attempt, max_attempts, created_at, available_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)", (submission.message_id, submission.queue, submission.envelope, submission.serializer_name, submission.serializer_version, submission.status, submission.max_attempts, _timestamp(now), submission.available_at_ms / 1000 if submission.available_at_ms is not None else None, submission.expires_at_ms / 1000 if submission.expires_at_ms is not None else None))
                     await self._broker._counter(cursor, submission.queue, "submitted_total")
                     if submission.status == MessageStatus.EXPIRED.value:
                         await self._broker._expire(cursor, submission.message_id, now, MessageStatus.READY, 0)
@@ -641,68 +655,6 @@ class SQLiteSubmissionStore:
                 await cursor.execute("ROLLBACK")
                 raise
         return results
-
-
-class SQLiteDelivery:
-    """持有一次租约及其不可公开的防陈旧 token。"""
-
-    def __init__(self, broker: SQLiteBroker, message: TaskMessage, delivery_id: str, lease_token: str,
-                 consumer_id: str, attempt: int, claimed_at: datetime, lease_until: datetime) -> None:
-        self._broker, self._lease_token, self._lease_seconds = broker, lease_token, (lease_until - claimed_at).total_seconds()
-        self.message, self.delivery_id, self.consumer_id = message, delivery_id, consumer_id
-        self.attempt, self.claimed_at, self.lease_until = attempt, claimed_at, lease_until
-
-    async def ack(self) -> FinishOutcome:
-        """确认业务处理成功；同一投递重复确认是幂等的。"""
-        return await self._broker._finish(self, "ack")
-
-    async def retry(self, *, reason: str | None = None) -> FinishOutcome:
-        """立即重新投递；超过最大尝试次数会转入 DLQ。"""
-        return await self._broker._finish(self, "retry", reason)
-
-    async def reject(self, *, reason: str, error: BaseException | None = None) -> FinishOutcome:
-        """拒绝消息并写入 DLQ。"""
-        if not reason:
-            raise ValidationError("reject 必须提供非空 reason")
-        return await self._broker._finish(self, "reject", reason, error)
-
-    async def extend_lease(self, *, seconds: float | None = None) -> datetime:
-        """延长当前 lease，且永不超过消息的 expires_at。"""
-        until = await self._broker._extend(self, seconds)
-        self.lease_until = until
-        return until
-
-
-class SQLiteConsumer(AbstractAsyncContextManager["SQLiteConsumer"]):
-    """通过轮询 SQLite 领取消息的异步迭代器。"""
-
-    def __init__(self, broker: SQLiteBroker, queue: str, consumer_id: str, options: ConsumerOptions) -> None:
-        self._broker, self.queue, self.consumer_id, self.options = broker, queue, consumer_id, options
-        self._closed = False
-
-    async def start(self) -> None:
-        self._broker._ensure_open()
-
-    async def close(self) -> None:
-        self._closed = True
-
-    async def __aenter__(self: ConsumerT) -> ConsumerT:
-        await self.start()
-        return self
-
-    async def __aexit__(self, *_: object) -> None:
-        await self.close()
-
-    def __aiter__(self) -> AsyncIterator[SQLiteDelivery]:
-        return self
-
-    async def __anext__(self) -> SQLiteDelivery:
-        while not self._closed:
-            delivery = await self._broker._claim(self.queue, self.consumer_id, self.options.lease_seconds)
-            if delivery is not None:
-                return delivery
-            await asyncio.sleep(self.options.poll_interval)
-        raise StopAsyncIteration
 
 
 class SQLiteAdmin:

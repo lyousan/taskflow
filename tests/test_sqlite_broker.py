@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 from datetime import timedelta
 
@@ -22,20 +21,7 @@ from taskflow import (
 from taskflow.middleware import Middleware
 from taskflow.submission import PreparedSubmission
 from taskflow.types import utc_now
-
-
-class BinaryJsonSerializer:
-    """故意产生非 UTF-8 bytes，用于验证 backend 不会假定文本编码。"""
-
-    name = "binary-json"
-    version = "7"
-
-    def dumps(self, value: object) -> bytes:
-        return b"\xff" + json.dumps(value, separators=(",", ":")).encode()
-
-    def loads(self, payload: bytes) -> object:
-        assert payload.startswith(b"\xff")
-        return json.loads(payload[1:].decode())
+from tests.support import BinaryJsonSerializer
 
 
 async def receive(broker: SQLiteBroker, queue: str = "jobs"):

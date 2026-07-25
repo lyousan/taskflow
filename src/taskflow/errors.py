@@ -19,3 +19,11 @@ class UnsupportedCapabilityError(TaskflowError):
 
 class BrokerClosedError(TaskflowError):
     """broker 或消费者已经关闭。"""
+
+
+class RetryableError(TaskflowError):
+    """提示高层 Worker 该失败可按 RetryPolicy 重试。"""
+
+
+class RejectMessage(TaskflowError):
+    """提示高层 Worker 直接拒绝当前消息并写入 DLQ。"""

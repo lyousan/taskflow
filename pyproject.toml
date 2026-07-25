@@ -1,6 +1,6 @@
 [project]
 name = "taskflow"
-version = "0.1.0"
+version = "0.2.0"
 description = "异步优先的可靠任务消息框架"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,6 +22,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/taskflow"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/taskflow/py.typed" = "taskflow/py.typed"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

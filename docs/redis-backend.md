@@ -1,4 +1,4 @@
-# Redis backend（v0.1）
+# Redis backend（v0.2）
 
 `RedisBroker` 面向 Redis standalone / Sentinel，使用 `redis.asyncio`。每个逻辑
 队列拥有一个 Stream 和固定 Consumer Group：消费者以 `XREADGROUP` 领取新消息；
@@ -8,13 +8,17 @@
 索引、READY 时间索引和统计。Retry 与 lease reclaim 会 `XACK + XDEL` 旧 entry，再 `XADD` 新 entry，
 所以同一消息的每次投递都有新 entry ID 和新 lease token。
 
+延迟提交和 `retry(delay=...)` 原子地写入 queue 的 `delayed` Sorted Set 并将状态设为
+`DELAYED`。维护逻辑以 Redis server time 驱动到期消息，并由 Lua 原子转入 Stream/READY；
+重复维护不会重复入队，若消息已过期则转入 EQ。
+
 `XREADGROUP` 与后续 lease 状态写入之间存在 Redis 命令边界。维护逻辑会以
 `XAUTOCLAIM` 扫描“已在 PEL、状态仍为 READY”的记录，并以 Lua 将其重新写入
 Stream；旧 entry ID 不能再 claim，防止进程在该窗口崩溃造成 PEL 永久滞留。
 
 维护循环由 `consumer` 拉取前触发，也可显式调用 `await broker.maintain(queue)`。它
 扫描 lease 与 expiry ZSet：超时 lease 会重新入 Stream 或进入 DLQ；到期消息进入 EQ。
-Redis Cluster 不在 v0.1 兼容范围内，因为精确 dedup key 与队列 key 可能不在同一
+Redis Cluster 不在 v0.2 兼容范围内，因为精确 dedup key 与队列 key 可能不在同一
 hash slot，无法承诺跨槽 Lua 原子性。
 
 `inspect()` 从 `ready` ZSet 读取 READY 数量与最早可消费时间，不扫描整个 Stream 或对

@@ -17,7 +17,7 @@ class DedupGuarantee(str, Enum):
 class BackendCapabilities:
     """一个 backend 明确承诺的功能集合。"""
 
-    delayed_delivery: bool = False
+    delayed_delivery: bool = True
     dead_letter: bool = True
     deduplication: bool = True
     lease_reclaim: bool = True

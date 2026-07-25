@@ -1,8 +1,11 @@
-# SQLite backend（v0.1）
+# SQLite backend（v0.2）
 
 `SQLiteBroker` 是本地脚本、测试与 CI 的持久化 backend。它以 SQLite 事务保护提交、
 领取、确认、重试、拒绝、租约回收和过期迁移的一致性，并通过异步 API 暴露全部 I/O
 路径。为了保证单连接上的事务正确性，当前实现以 `asyncio.Lock` 串行化操作。
+`submit(delay=...)` 和 `Delivery.retry(delay=...)` 在同一事务中持久化 `DELAYED` 与
+`available_at`；claim、`maintain()` 和 `inspect()` 会幂等地把已到期消息转为 READY。
+因此进程重启期间不会丢失延迟消息，且 `expires_at` 已到期的 delayed 消息直接进入 EQ。
 `messages` 还持久化 `serializer_name` 与 `serializer_version`；若当前 Broker 的
 serializer 不匹配历史消息的标识，读取会明确失败，而不会以错误的 serializer 解码。
 
