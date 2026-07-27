@@ -138,3 +138,7 @@ class ExpiredMessage:
     status_at_expiry: MessageStatus
     expired_at: datetime
     attempt: int
+
+
+# Kept as a compatibility import for callers that group public models under types.
+from .config import QueueConfig  # noqa: F401

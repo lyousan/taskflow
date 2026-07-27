@@ -1,6 +1,6 @@
 # Taskflow
 
-Taskflow 是独立、可嵌入、异步优先的 Python 任务消息框架。v0.2 提供可靠的
+Taskflow 是独立、可嵌入、异步优先的 Python 任务消息框架。v0.3 提供可靠的
 至少一次投递、显式 ACK、延迟重试、租约回收、DLQ、EQ 与精确提交去重，以及可直接运行
 异步 handler 的高层 Worker。
 
@@ -12,11 +12,15 @@ Redis backend 使用 Streams 与 Consumer Group；主流状态变迁由 Lua 原�
 import asyncio
 from datetime import timedelta
 from taskflow import SQLiteBroker
+from taskflow import QueueConfig
 from taskflow.retry import ExponentialBackoff, RetryPolicy
 
 
 async def main() -> None:
-    async with SQLiteBroker("taskflow.db") as broker:
+    async with SQLiteBroker(
+        "taskflow.db",
+        queues={"crawl.fetch": QueueConfig(max_attempts=5)},
+    ) as broker:
         await broker.submit(
             queue="crawl.fetch",
             payload={"url": "https://example.com"},
@@ -76,6 +80,22 @@ asyncio.run(main())
   会进入 EQ。
 
 开发路线与版本验收标准见 [`docs/roadmap.md`](docs/roadmap.md)。
+v0.2 升级说明见 [`docs/migration-v0.2-v0.3.md`](docs/migration-v0.2-v0.3.md)。
+
+## v0.3 配置与扩展点
+
+`QueueConfig` 可为每个 queue 设置最大尝试次数、lease、重试策略、默认 dedup TTL
+和 payload 大小上限。配置优先级固定为：单次 `submit()`/`worker()` 参数 > queue
+配置 > broker 默认值。`submission_stores` 与 `queue_submission_profiles` 可将不同
+队列路由到不同的 `SubmissionStore`；通过 `submission_capabilities(queue)` 查询实际
+能力。queue、namespace 和 profile 统一使用 `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`，且
+不能是只有 `.` 或 `-` 的名称。
+
+可注入 `EventSink` 和 `MetricsSink` 获取标准生命周期事件和指标；事件包含
+`event_name`、backend、queue、message/delivery/consumer、attempt、status、reason 和
+error_type，指标不会把完整 dedup key 或 payload 放入 label。`SerializerRegistry` 按
+`serializer_name + serializer_version` 解码历史消息，未注册时抛出
+`SerializerUnavailableError`。
 
 ## 开发与 Release 验证
 

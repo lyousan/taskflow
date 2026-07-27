@@ -286,6 +286,39 @@ async def test_extend_lease_is_capped_by_message_expiry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_extend_lease_expiry_commits_eq_transition_and_observability() -> None:
+    class Metrics:
+        def __init__(self) -> None:
+            self.increments: list[str] = []
+
+        async def increment(self, name, value=1, **labels):  # type: ignore[no-untyped-def]
+            self.increments.append(name)
+
+        async def observe(self, name, value, **labels):  # type: ignore[no-untyped-def]
+            pass
+
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[object] = []
+
+        async def emit(self, event) -> None:  # type: ignore[no-untyped-def]
+            self.events.append(event)
+
+    now, metrics, sink = [utc_now()], Metrics(), Sink()
+    async with SQLiteBroker(clock=lambda: now[0], metrics=metrics, event_sink=sink) as broker:
+        submitted = await broker.submit(queue="jobs", payload={}, expires_at=now[0] + timedelta(seconds=1))
+        delivery = await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=10)).__anext__()
+        now[0] += timedelta(seconds=2)
+        with pytest.raises(LeaseLostError, match="过期"):
+            await delivery.extend_lease(seconds=1)
+        state = await (await broker._connection.execute("SELECT status FROM messages WHERE id=?", (submitted.message_id,))).fetchone()  # type: ignore[union-attr]
+        assert state is not None and state["status"] == "expired"
+        assert [item.message.id for item in await broker.admin.list_expired("jobs")] == [submitted.message_id]
+    assert metrics.increments.count("expired_total") == 1
+    assert [item.event_name for item in sink.events].count("expired") == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_expired_delivery_ack_records_expiry_not_ack() -> None:
     class Recorder:
         def __init__(self) -> None:

@@ -1,4 +1,13 @@
-# v0.2 Worker、延迟调度、观测与 serializer
+# v0.3 Worker、配置、观测与 serializer
+
+## QueueConfig 与扩展点
+
+每个 broker 可以通过 `queues={"queue-name": QueueConfig(...)}` 配置队列默认策略：
+最大尝试次数、lease 时长、可选 RetryPolicy、dedup TTL 和 payload 大小上限。未设置
+queue RetryPolicy 时，Worker 沿用消息的 `max_attempts`；单次
+`submit()`/`worker()` 参数优先于 queue 配置，queue 配置优先于 broker 默认值。
+SubmissionStore profile 在 broker 创建时校验，并可用 `submission_capabilities(queue)`
+查询实际去重和批量能力。
 
 `ConsumerOptions.concurrency` 由 `broker.worker()` / `broker.run()` 使用；两个入口均支持
 `consumer_id`、`retry_policy` 和 `heartbeat_seconds`；单个
@@ -12,7 +21,7 @@ graceful shutdown。状态迁移失败会暴露给调用方，避免被静默吞
 Worker 默认每个 lease 的三分之一时间自动执行一次 heartbeat；可用
 `heartbeat_seconds=` 覆盖。它只在 handler 持续运行时续租，不能改变 at-least-once 语义。
 
-v0.2 没有独立的后台 scheduler。延迟消息在 claim、inspect 或显式 `maintain()` 时转为
+当前版本没有独立的后台 scheduler。延迟消息在 claim、inspect 或显式 `maintain()` 时转为
 READY；长期空闲队列建议运行每秒一次的 maintenance loop。多个实例可以同时维护同一队列，
 转移操作是幂等的，不会重复入队。
 
@@ -21,15 +30,22 @@ READY；长期空闲队列建议运行每秒一次的 maintenance loop。多个�
 `maintain()`、`claim()` 和 `inspect()` 会驱动调度，因此不需要额外常驻调度进程。`expires_at`
 早于到期时间时，消息会直接进入 EQ，绝不重新交给 handler。
 
-Broker 可接收 `MetricsSink`。它包含 `increment()` 和 `observe()` 两个异步方法，并报告
+Redis 的 `expires_at` 和 lease 判断以 Redis server `TIME` 为准。请使用 NTP 同步 Redis 和
+应用主机；启动时若两者相差至少 5 秒，broker 会记录告警。生产者需要生成相对过期时间时，
+应确保其时钟已同步；backend 不会混用本地时间与 Redis 时间。
+
+Broker 可接收 v0.2 兼容的 `MetricsSink`（`increment()`、`observe()`）。实现可选
+`GaugeMetricsSink.gauge()` 时，ready/leased/delayed 快照会作为 gauge 报告；否则保持
+observe 行为。它报告
 提交、重复、领取、ACK、Retry、死信、lease lost、处理耗时和 ready/leased 队列快照。
-Middleware 的 `event` 钩子接收 `BrokerEvent`，其中包含 queue、message/delivery ID、
+Broker 也可接收 `EventSink`。其 `TaskflowEvent` 包含 `event_name`、backend、queue、message/delivery ID、
 attempt、consumer、reason、serializer、status 与时间戳。
 默认 Middleware 和 MetricsSink 的异常会被记录并隔离，不会把已经提交的消息状态伪装成失败；
 需要严格传播 hook 异常时可使用 `Middleware(fail_fast=True)`。
 
 一个 Broker 仍有一个默认 encoder；`SerializerRegistry` 用持久化的 name/version 为历史
-消息选择 decoder。未注册的标识会以清晰的 `ValidationError` 失败，而不会尝试错误解码。
+消息选择 decoder。未注册的标识会以清晰的 `SerializerUnavailableError`（也是
+`ValidationError` 子类）失败，而不会尝试错误解码。
 
 完整的开发与 release 验证需同时安装开发工具和 Redis backend：
 

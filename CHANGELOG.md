@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- 新增按 queue 的 `QueueConfig` 与固定配置优先级。
+- 新增 SubmissionStore profile 路由和严格 queue/namespace/profile 命名校验。
+- 新增标准 `EventSink`、`TaskflowEvent`、Metrics gauge 与 serializer unavailable 错误。
+- Redis 的 expiry / lease 明确以 Redis server `TIME` 为权威；启动时会报告显著时钟偏差。
+- 修复 SQLite lease 续租遇到 expiry 时的事务回滚，并补齐 SQLite / Redis claim、续租过期路径的
+  EQ、`expired` 事件与 `expired_total` 指标一致性。
+
 ## 0.2.0
 
 - 新增高层 `TaskWorker` 的 RetryPolicy、异常分类和自动 lease heartbeat。

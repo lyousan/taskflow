@@ -17,6 +17,10 @@ class UnsupportedCapabilityError(TaskflowError):
     """当前 backend 未提供调用方所请求的能力。"""
 
 
+class SerializerUnavailableError(ValidationError):
+    """历史消息所需的 serializer 未注册或不可用。"""
+
+
 class BrokerClosedError(TaskflowError):
     """broker 或消费者已经关闭。"""
 

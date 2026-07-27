@@ -23,7 +23,6 @@ from taskflow import (
     SubmitRequest,
     ValidationError,
 )
-from taskflow.types import utc_now
 from tests.support import BinaryJsonSerializer
 
 pytest.importorskip("redis.asyncio")
@@ -54,6 +53,12 @@ async def receive(broker: RedisBroker):
     """领取一条 jobs 消息。"""
 
     return await broker.consumer("jobs").__anext__()
+
+
+async def redis_now(broker: RedisBroker):
+    """Create relative timestamps from the backend's authoritative clock."""
+
+    return await broker._now()
 
 
 @pytest.mark.asyncio
@@ -202,8 +207,9 @@ async def test_redis_worker_cancellation_reclaims_delivery(broker: RedisBroker) 
 
 @pytest.mark.asyncio
 async def test_redis_delayed_message_expiring_before_due_goes_to_eq(broker: RedisBroker) -> None:
+    now = await redis_now(broker)
     submitted = await broker.submit(queue="jobs", payload={}, delay=timedelta(milliseconds=40),
-                                    expires_at=utc_now() + timedelta(milliseconds=10))
+                                    expires_at=now + timedelta(milliseconds=10))
     await asyncio.sleep(0.05)
     stats = await broker.inspect("jobs")
     assert stats.ready == 0 and stats.delayed == 0 and stats.expired == 1
@@ -266,7 +272,8 @@ async def test_reject_lease_reclaim_and_expiry(broker: RedisBroker) -> None:
     await broker.maintain("jobs")
     assert any(item.message.id == leased.message.id for item in await broker.admin.list_dead_letters("jobs"))
 
-    expired = await broker.submit(queue="jobs", payload={"kind": "expired"}, expires_at=utc_now() - timedelta(seconds=1))
+    expired = await broker.submit(queue="jobs", payload={"kind": "expired"},
+                                  expires_at=await redis_now(broker) - timedelta(seconds=1))
     assert any(item.message.id == expired.message_id for item in await broker.admin.list_expired("jobs"))
 
 
@@ -282,7 +289,8 @@ async def test_stale_lease_cannot_ack_and_expired_message_can_replay(broker: Red
         await old.ack()
     await current.ack()
 
-    result = await broker.submit(queue="jobs", payload={"kind": "expiry"}, expires_at=utc_now() - timedelta(seconds=1))
+    result = await broker.submit(queue="jobs", payload={"kind": "expiry"},
+                                 expires_at=await redis_now(broker) - timedelta(seconds=1))
     await broker.admin.replay_expired("jobs", result.message_id, expires_at=None)
     replayed = await receive(broker)
     assert replayed.message.id == result.message_id
@@ -335,7 +343,7 @@ async def test_expired_lease_cannot_be_terminated_or_extended(broker: RedisBroke
 
 @pytest.mark.asyncio
 async def test_extend_lease_is_capped_by_message_expiry(broker: RedisBroker) -> None:
-    await broker.submit(queue="jobs", payload={}, expires_at=utc_now() + timedelta(seconds=30))
+    await broker.submit(queue="jobs", payload={}, expires_at=await redis_now(broker) + timedelta(seconds=30))
     delivery = await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=1)).__anext__()
     extended = await delivery.extend_lease(seconds=300)
     assert delivery.message.expires_at is not None
@@ -344,10 +352,10 @@ async def test_extend_lease_is_capped_by_message_expiry(broker: RedisBroker) -> 
 
 @pytest.mark.asyncio
 async def test_initial_expiry_and_expired_ack_keep_indexes_and_stats_consistent(broker: RedisBroker) -> None:
-    initial = await broker.submit(queue="jobs", payload={}, expires_at=utc_now() - timedelta(seconds=1))
+    initial = await broker.submit(queue="jobs", payload={}, expires_at=await redis_now(broker) - timedelta(seconds=1))
     assert await broker._redis.zscore(broker._queue_key("jobs", "expiry"), initial.message_id) is None
 
-    active = await broker.submit(queue="jobs", payload={}, expires_at=utc_now() + timedelta(seconds=1))
+    active = await broker.submit(queue="jobs", payload={}, expires_at=await redis_now(broker) + timedelta(seconds=1))
     delivery = await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=2)).__anext__()
     assert delivery.message.id == active.message_id
     await asyncio.sleep(1.05)
@@ -359,7 +367,71 @@ async def test_initial_expiry_and_expired_ack_keep_indexes_and_stats_consistent(
 
 
 @pytest.mark.asyncio
-async def test_queue_profiles_route_submissions_and_preserve_batch_order() -> None:
+async def test_claim_time_expiry_publishes_one_event_and_metric(broker: RedisBroker, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    class Metrics:
+        def __init__(self) -> None:
+            self.increments: list[str] = []
+
+        async def increment(self, name, value=1, **labels):  # type: ignore[no-untyped-def]
+            self.increments.append(name)
+
+        async def observe(self, name, value, **labels):  # type: ignore[no-untyped-def]
+            pass
+
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[object] = []
+
+        async def emit(self, event) -> None:  # type: ignore[no-untyped-def]
+            self.events.append(event)
+
+    async def skip_maintenance(_queue=None) -> int:  # type: ignore[no-untyped-def]
+        return 0
+
+    metrics, sink = Metrics(), Sink()
+    broker.metrics, broker.event_sink = metrics, sink
+    submitted = await broker.submit(queue="jobs", payload={}, expires_at=await redis_now(broker) + timedelta(milliseconds=50))
+    await asyncio.sleep(0.06)
+    monkeypatch.setattr(broker, "maintain", skip_maintenance)
+    assert await broker._claim("jobs", "claim-expiry", 10) is None
+    assert [item.message.id for item in await broker.admin.list_expired("jobs")] == [submitted.message_id]
+    assert metrics.increments.count("expired_total") == 1
+    assert [item.event_name for item in sink.events].count("expired") == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_extend_lease_expiry_commits_eq_transition_and_observability(broker: RedisBroker) -> None:
+    class Metrics:
+        def __init__(self) -> None:
+            self.increments: list[str] = []
+
+        async def increment(self, name, value=1, **labels):  # type: ignore[no-untyped-def]
+            self.increments.append(name)
+
+        async def observe(self, name, value, **labels):  # type: ignore[no-untyped-def]
+            pass
+
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[object] = []
+
+        async def emit(self, event) -> None:  # type: ignore[no-untyped-def]
+            self.events.append(event)
+
+    metrics, sink = Metrics(), Sink()
+    broker.metrics, broker.event_sink = metrics, sink
+    submitted = await broker.submit(queue="jobs", payload={}, expires_at=await redis_now(broker) + timedelta(milliseconds=50))
+    delivery = await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=10)).__anext__()
+    await asyncio.sleep(0.06)
+    with pytest.raises(LeaseLostError, match="过期"):
+        await delivery.extend_lease(seconds=1)
+    assert [item.message.id for item in await broker.admin.list_expired("jobs")] == [submitted.message_id]
+    assert metrics.increments.count("expired_total") == 1
+    assert [item.event_name for item in sink.events].count("expired") == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_queue_profiles_route_submissions_and_reject_mixed_batches() -> None:
     namespace = f"taskflow-profile-{uuid4()}"
     instance = RedisBroker.from_url(
         namespace=namespace,
@@ -377,13 +449,50 @@ async def test_queue_profiles_route_submissions_and_preserve_batch_order() -> No
         assert instance.submission_capabilities("exact-jobs").batch_atomic
         results = await instance.submit_many([
             SubmitRequest(queue="exact-jobs", payload={"n": 1}, dedup_scope="s", dedup_key="same", dedup_ttl=timedelta(minutes=1)),
-            SubmitRequest(queue="plain-jobs", payload={"n": 2}),
             SubmitRequest(queue="exact-jobs", payload={"n": 3}, dedup_scope="s", dedup_key="same", dedup_ttl=timedelta(minutes=1)),
         ])
-        assert [result.accepted for result in results] == [True, True, False]
+        assert [result.accepted for result in results] == [True, False]
+        with pytest.raises(ValidationError, match="混合"):
+            await instance.submit_many([
+                SubmitRequest(queue="exact-jobs", payload={"n": 1}),
+                SubmitRequest(queue="plain-jobs", payload={"n": 2}),
+            ])
+        assert (await instance.inspect("plain-jobs")).submitted_total == 0
     finally:
         await clean(instance)
         await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_maintenance_emits_expiry_reclaim_and_dlq_events(broker: RedisBroker) -> None:
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[object] = []
+
+        async def emit(self, event) -> None:  # type: ignore[no-untyped-def]
+            self.events.append(event)
+
+    sink = Sink()
+    broker.event_sink = sink
+    await broker.submit(queue="jobs", payload={}, delay=timedelta(milliseconds=40),
+                        expires_at=await redis_now(broker) + timedelta(milliseconds=10))
+    await asyncio.sleep(0.05)
+    await broker.maintain("jobs")
+
+    await broker.submit(queue="jobs", payload={})
+    await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=0.01)).__anext__()
+    await asyncio.sleep(0.02)
+    await broker.maintain("jobs")
+    await (await broker.consumer("jobs").__anext__()).ack()
+
+    await broker.submit(queue="jobs", payload={}, max_attempts=1)
+    await broker.consumer("jobs", options=ConsumerOptions(lease_seconds=0.01)).__anext__()
+    await asyncio.sleep(0.02)
+    await broker.maintain("jobs")
+
+    names = [event.event_name for event in sink.events]  # type: ignore[attr-defined]
+    assert "expired" in names and "reclaimed" in names and "dead_lettered" in names
+    assert all(event.backend == "redis" for event in sink.events)  # type: ignore[attr-defined]
 
 
 def test_redis_namespace_must_be_a_safe_persistent_identifier() -> None:
@@ -393,6 +502,8 @@ def test_redis_namespace_must_be_a_safe_persistent_identifier() -> None:
     for namespace in ("", "with:colon", "has{tag}", "中文", "x" * 256):
         with pytest.raises(ValidationError, match="namespace"):
             RedisBroker(UnusedRedis(), namespace=namespace)
+
+    assert RedisBroker(UnusedRedis(), namespace="_legacy", allow_legacy_names=True)._namespace == "_legacy"
 
 
 @pytest.mark.asyncio

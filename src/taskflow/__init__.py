@@ -7,16 +7,24 @@ from .broker import (
     SQLiteSubmissionStore,
 )
 from .capabilities import BackendCapabilities, DedupGuarantee, SubmissionCapabilities
+from .config import QueueConfig
 from .errors import (
     BrokerClosedError,
     LeaseLostError,
     RejectMessage,
     RetryableError,
+    SerializerUnavailableError,
     TaskflowError,
     UnsupportedCapabilityError,
     ValidationError,
 )
-from .observability import BrokerEvent, MetricsSink
+from .observability import (
+    BrokerEvent,
+    EventSink,
+    GaugeMetricsSink,
+    MetricsSink,
+    TaskflowEvent,
+)
 from .protocols import SubmissionStore, TaskBroker, TaskConsumer, TaskDelivery
 from .retry import ExponentialBackoff, FixedBackoff, ImmediateBackoff, RetryPolicy
 from .serialization import JsonSerializer, Serializer, SerializerRegistry
@@ -41,15 +49,18 @@ __all__ = [
     "ConsumerOptions",
     "DeadLetter",
     "DedupGuarantee",
+    "EventSink",
     "ExpiredMessage",
     "ExponentialBackoff",
     "FinishOutcome",
     "FixedBackoff",
+    "GaugeMetricsSink",
     "ImmediateBackoff",
     "JsonSerializer",
     "LeaseLostError",
     "MessageStatus",
     "MetricsSink",
+    "QueueConfig",
     "QueueStats",
     "RedisBroker",
     "RedisStringDedupSubmissionStore",
@@ -61,6 +72,7 @@ __all__ = [
     "SQLiteSubmissionStore",
     "Serializer",
     "SerializerRegistry",
+    "SerializerUnavailableError",
     "SubmissionCapabilities",
     "SubmissionStore",
     "SubmitDecision",
@@ -72,6 +84,7 @@ __all__ = [
     "TaskMessage",
     "TaskWorker",
     "TaskflowError",
+    "TaskflowEvent",
     "UnsupportedCapabilityError",
     "ValidationError",
 ]

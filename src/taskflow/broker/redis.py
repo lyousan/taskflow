@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -12,10 +13,11 @@ from typing import Any, cast
 from typing_extensions import Self
 
 from ..capabilities import BackendCapabilities, DedupGuarantee, SubmissionCapabilities
+from ..config import QueueConfig
 from ..errors import BrokerClosedError, LeaseLostError, ValidationError
 from ..middleware import Middleware
 from ..naming import validate_persistent_name
-from ..observability import MetricsSink, metric
+from ..observability import EventSink, MetricsSink, metric
 from ..observability import event as emit_event
 from ..protocols import TaskBroker
 from ..retry import RetryPolicy
@@ -40,6 +42,10 @@ from ._time import new_id as _new_id
 from ._time import timestamp as _timestamp
 from .redis_components import RedisConsumer, RedisDelivery
 
+logger = logging.getLogger(__name__)
+
+_CLOCK_SKEW_WARNING_SECONDS = 5.0
+
 
 class RedisBroker:
     """使用 Redis Lua 原子迁移实现的异步 v0.1 backend。
@@ -62,17 +68,32 @@ class RedisBroker:
                  metrics: MetricsSink | None = None,
                  pending_recovery_seconds: float = 1.0, submission_store: Any | None = None,
                  submission_stores: Mapping[str, Any] | None = None,
-                 queue_submission_profiles: Mapping[str, str] | None = None) -> None:
-        if default_max_attempts < 1 or pending_recovery_seconds < 0:
+                 queue_submission_profiles: Mapping[str, str] | None = None,
+                 queues: Mapping[str, QueueConfig] | None = None,
+                 event_sink: EventSink | None = None,
+                 events: EventSink | None = None,
+                 allow_legacy_names: bool = False) -> None:
+        if (isinstance(default_max_attempts, bool) or not isinstance(default_max_attempts, int)
+                or default_max_attempts < 1 or pending_recovery_seconds < 0):
             raise ValidationError("default_max_attempts 必须大于等于 1，pending_recovery_seconds 不能为负数")
-        validate_persistent_name(namespace, label="namespace")
+        validate_persistent_name(namespace, label="namespace", allow_legacy=allow_legacy_names)
         self._redis, self._namespace = redis, namespace
+        self._allow_legacy_names = allow_legacy_names
         self._default_max_attempts, self._default_dedup_ttl = default_max_attempts, default_dedup_ttl
+        self._default_queue_config = QueueConfig(max_attempts=default_max_attempts, default_dedup_ttl=default_dedup_ttl)
+        self._queues = dict(queues or {})
+        for queue, config in self._queues.items():
+            validate_persistent_name(queue, label="queue", allow_legacy=self._allow_legacy_names)
+            if not isinstance(config, QueueConfig):
+                raise ValidationError("queues 的值必须是 QueueConfig")
         self._serializer, self._id_factory = serializer or JsonSerializer(), id_factory
         self.serializer_registry = serializer_registry or SerializerRegistry([self._serializer])
         self._pending_recovery_ms = int(pending_recovery_seconds * 1000)
         self._configure_submission_stores(submission_store, submission_stores, queue_submission_profiles)
-        self.middleware, self.metrics, self._closed = middleware or Middleware(), metrics, False
+        if event_sink is not None and events is not None:
+            raise ValidationError("event_sink 与 events 不能同时配置")
+        self.middleware, self.metrics, self.event_sink, self._closed = middleware or Middleware(), metrics, event_sink or events, False
+        self._clock_skew_checked = False
         self.admin = RedisAdmin(self)
 
     @classmethod
@@ -112,7 +133,11 @@ class RedisBroker:
         return f"{self._namespace}:dedup:{scope_hash}:{key_hash}"
 
     def _validate_queue(self, queue: str) -> None:
-        validate_persistent_name(queue, label="queue")
+        validate_persistent_name(queue, label="queue", allow_legacy=self._allow_legacy_names)
+
+    def _queue_config(self, queue: str) -> QueueConfig:
+        self._validate_queue(queue)
+        return self._queues.get(queue, self._default_queue_config)
 
     def _configure_submission_stores(self, submission_store: Any | None,
                                      submission_stores: Mapping[str, Any] | None,
@@ -126,7 +151,9 @@ class RedisBroker:
             name: store(self) if callable(store) and not hasattr(store, "submit") else store
             for name, store in configured.items()
         }
-        if any(not hasattr(store, "submit") or not hasattr(store, "submit_many") for store in self._submission_stores.values()):
+        for name in self._submission_stores:
+            validate_persistent_name(name, label="submission profile", allow_legacy=self._allow_legacy_names)
+        if any(not hasattr(store, "submit") or not hasattr(store, "submit_many") or not hasattr(store, "capabilities") for store in self._submission_stores.values()):
             raise ValidationError("每个 submission store 都必须实现 submit 与 submit_many")
         self._queue_submission_profiles = dict(queue_submission_profiles or {})
         for queue, profile in self._queue_submission_profiles.items():
@@ -156,6 +183,16 @@ class RedisBroker:
         """验证连接，避免首个业务提交才暴露连接配置错误。"""
         self._ensure_open()
         await self._redis.ping()
+        if not self._clock_skew_checked:
+            server_now = await self._now()
+            skew_seconds = abs((utc_now() - server_now).total_seconds())
+            self._clock_skew_checked = True
+            if skew_seconds >= _CLOCK_SKEW_WARNING_SECONDS:
+                logger.warning(
+                    "taskflow Redis server clock differs materially from the application clock; "
+                    "Redis time remains authoritative for expiry and leases",
+                    extra={"clock_skew_seconds": skew_seconds, "namespace": self._namespace},
+                )
 
     async def close(self) -> None:
         """关闭底层异步 Redis client。"""
@@ -206,10 +243,15 @@ class RedisBroker:
         if result.accepted:
             await self.middleware.emit("after_submit", message, result)
             await metric(self.metrics, "submitted_total", queue=queue)
-            await emit_event(self.middleware, "submitted", message, status=prepared.status, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+            await emit_event(self.middleware, "submitted", message, status=prepared.status, backend="redis", event_sink=self.event_sink, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+            if prepared.status == MessageStatus.EXPIRED.value:
+                await metric(self.metrics, "expired_total", queue=queue)
+                await emit_event(self.middleware, "expired", message, status=MessageStatus.EXPIRED.value,
+                                 reason="expired_on_submit", backend="redis", event_sink=self.event_sink,
+                                 serializer_name=self._serializer.name, serializer_version=self._serializer.version)
         else:
             await metric(self.metrics, "duplicate_total", queue=queue)
-            await emit_event(self.middleware, "duplicate", message, status=prepared.status, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+            await emit_event(self.middleware, "duplicate", message, status=prepared.status, backend="redis", event_sink=self.event_sink, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
         return result
 
     async def _prepare_submission(self, *, queue: str, payload: Any, metadata: Mapping[str, Any] | None = None,
@@ -222,19 +264,28 @@ class RedisBroker:
         self._validate_queue(queue)
         if (dedup_key is None) != (dedup_scope is None):
             raise ValidationError("dedup_key 与 dedup_scope 必须同时提供")
-        ttl = self._default_dedup_ttl if dedup_ttl is None else dedup_ttl
+        config = self._queue_config(queue)
+        ttl = (config.default_dedup_ttl if queue in self._queues else self._default_dedup_ttl) if dedup_ttl is None else dedup_ttl
+        if ttl is not None and not isinstance(ttl, timedelta):
+            raise ValidationError("dedup_ttl 必须是 timedelta")
         if dedup_key is not None and (ttl is None or ttl.total_seconds() <= 0):
             raise ValidationError("启用去重时必须提供正数 dedup_ttl 或配置默认值")
-        attempts = max_attempts if max_attempts is not None else self._default_max_attempts
-        if attempts < 1:
+        attempts = max_attempts if max_attempts is not None else config.max_attempts
+        if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 1:
             raise ValidationError("max_attempts 必须大于等于 1")
         now = await self._now()
+        if delay is not None and not isinstance(delay, timedelta):
+            raise ValidationError("delay 必须是 timedelta")
         if delay is not None and delay.total_seconds() < 0:
             raise ValidationError("delay 不能为负数")
+        if expires_at is not None and expires_at.tzinfo is None:
+            raise ValidationError("expires_at 必须带时区")
         available_at = now + delay if delay and delay.total_seconds() > 0 else None
         message = TaskMessage(self._id_factory(), queue, payload, metadata or {}, dedup_key, dedup_scope,
                               workflow_id, parent_id, now, expires_at, attempts, available_at)
         envelope = self._encode(message)
+        if config.max_payload_bytes is not None and len(self._serializer.dumps(payload)) > config.max_payload_bytes:
+            raise ValidationError(f"payload 超过 queue {queue!r} 的 max_payload_bytes 限制")
         initial_expired = bool(expires_at and expires_at <= now)
         prepared = PreparedSubmission(message.id, queue, base64.b64decode(envelope.encode("ascii")),
             MessageStatus.EXPIRED.value if initial_expired else (MessageStatus.DELAYED.value if available_at else MessageStatus.READY.value), now,
@@ -253,12 +304,13 @@ class RedisBroker:
         for _, message in prepared_messages:
             await self.middleware.emit("before_submit", message)
         results: list[SubmitResult | None] = [None] * len(prepared_messages)
-        groups: dict[Any, list[tuple[int, PreparedSubmission]]] = {}
-        for index, (prepared, _) in enumerate(prepared_messages):
-            groups.setdefault(self._submission_store_for(prepared.queue), []).append((index, prepared))
-        for store, group in groups.items():
-            accepted = await store.submit_many([prepared for _, prepared in group])
-            for (index, _), result in zip(group, accepted):
+        profiles = {self._queue_submission_profiles.get(prepared.queue, "default") for prepared, _ in prepared_messages}
+        if len(profiles) > 1:
+            raise ValidationError("submit_many 不支持混合 SubmissionStore profile")
+        if prepared_messages:
+            store = self._submission_store_for(prepared_messages[0][0].queue)
+            accepted = await store.submit_many([prepared for prepared, _ in prepared_messages])
+            for index, result in enumerate(accepted):
                 results[index] = result
         finalized = [result for result in results if result is not None]
         for result, (prepared, message) in zip(results, prepared_messages):
@@ -266,7 +318,12 @@ class RedisBroker:
             if result.accepted:
                 await self.middleware.emit("after_submit", message, result)
                 await metric(self.metrics, "submitted_total", queue=message.queue)
-                await emit_event(self.middleware, "submitted", message, status=prepared.status, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+                await emit_event(self.middleware, "submitted", message, status=prepared.status, backend="redis", event_sink=self.event_sink, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+                if prepared.status == MessageStatus.EXPIRED.value:
+                    await metric(self.metrics, "expired_total", queue=message.queue)
+                    await emit_event(self.middleware, "expired", message, status=MessageStatus.EXPIRED.value,
+                                     reason="expired_on_submit", backend="redis", event_sink=self.event_sink,
+                                     serializer_name=self._serializer.name, serializer_version=self._serializer.version)
         return finalized
 
     def consumer(self, queue: str, *, consumer_id: str | None = None,
@@ -274,7 +331,7 @@ class RedisBroker:
         """创建多进程安全的异步消费者。"""
         self._ensure_open()
         self._validate_queue(queue)
-        chosen = options or ConsumerOptions()
+        chosen = options or ConsumerOptions(lease_seconds=self._queue_config(queue).lease.total_seconds())
         if chosen.lease_seconds <= 0 or chosen.poll_interval < 0 or chosen.concurrency < 1:
             raise ValidationError("消费者参数必须有效")
         return RedisConsumer(self, queue, consumer_id or self._id_factory(), chosen)
@@ -283,7 +340,9 @@ class RedisBroker:
                consumer_id: str | None = None, options: ConsumerOptions | None = None,
                retry_policy: RetryPolicy | None = None, heartbeat_seconds: float | None = None) -> TaskWorker:
         """创建一个真正受 ``concurrency`` 限制的 Worker。"""
-        selected = options or ConsumerOptions()
+        selected = options or ConsumerOptions(lease_seconds=self._queue_config(queue).lease.total_seconds())
+        if retry_policy is None and queue in self._queues:
+            retry_policy = self._queue_config(queue).retry_policy
         return TaskWorker(cast(TaskBroker, self), queue, handler, concurrency=concurrency if concurrency is not None else selected.concurrency,
                           consumer_id=consumer_id, options=selected, retry_policy=retry_policy,
                           heartbeat_seconds=heartbeat_seconds)
@@ -325,13 +384,19 @@ class RedisBroker:
                                             self._queue_key(queue, "eq"), self._queue_key(queue, "expiry"), self._queue_key(queue, "stream"),
                                             self._queue_key(queue, "ready"),
                                             str(_timestamp(now)), message_id, consumer_id, delivery_id, token, str(_timestamp(lease_until)), self._group_name(), entry_id))
+        if status == -1:
+            await self._emit_maintenance_event(
+                message_id, "expired", MessageStatus.EXPIRED.value,
+                reason="expired_during_claim", metric_name="expired_total",
+            )
+            return None
         if status <= 0:
             return None
         fields = await self._redis.hgetall(self._message_key(message_id))
         delivery = RedisDelivery(self, self._decode(fields["envelope"], fields.get("serializer_name"), fields.get("serializer_version")), delivery_id, token, consumer_id, status, now, lease_until)
         await self.middleware.emit("after_claim", delivery)
         await metric(self.metrics, "claimed_total", queue=queue)
-        await emit_event(self.middleware, "claimed", delivery.message, status=MessageStatus.LEASED.value, delivery=delivery, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+        await emit_event(self.middleware, "claimed", delivery.message, status=MessageStatus.LEASED.value, delivery=delivery, backend="redis", event_sink=self.event_sink, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
         return delivery
 
     async def _finish(self, delivery: RedisDelivery, action: str, reason: str | None = None,
@@ -400,7 +465,7 @@ class RedisBroker:
         }[outcome]
         await self.middleware.emit(f"after_{event_name}", delivery, reason)
         await metric(self.metrics, metric_name, queue=queue)
-        await emit_event(self.middleware, event_name, delivery.message, status=outcome.value, delivery=delivery, reason=reason, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
+        await emit_event(self.middleware, event_name, delivery.message, status=outcome.value, delivery=delivery, reason=reason, error_type=error_type or None, backend="redis", event_sink=self.event_sink, serializer_name=self._serializer.name, serializer_version=self._serializer.version)
         return outcome
 
     async def _extend(self, delivery: RedisDelivery, seconds: float | None) -> datetime:
@@ -422,11 +487,26 @@ class RedisBroker:
               redis.call('XACK', KEYS[3], ARGV[5], entry); redis.call('XDEL', KEYS[3], entry)
               redis.call('HSET', KEYS[1], 'status', 'expired', 'last_action', 'expired', 'expired_at', now, 'status_at_expiry', 'leased', 'last_delivery_id', ARGV[1])
               redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until')
-              redis.call('ZREM', KEYS[2], ARGV[4]); redis.call('ZREM', KEYS[4], ARGV[4]); redis.call('LPUSH', KEYS[5], ARGV[4]); return 0
+              redis.call('ZREM', KEYS[2], ARGV[4]); redis.call('ZREM', KEYS[4], ARGV[4]); redis.call('LPUSH', KEYS[5], ARGV[4]); return -1
             end
             redis.call('HSET', KEYS[1], 'lease_until', ARGV[3]); redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4]); return 1
         """
-        if until <= now or not await self._redis.eval(script, 5, self._message_key(delivery.message.id), self._queue_key(delivery.message.queue, "leases"), self._queue_key(delivery.message.queue, "stream"), self._queue_key(delivery.message.queue, "expiry"), self._queue_key(delivery.message.queue, "eq"), delivery.delivery_id, delivery._lease_token, str(_timestamp(until)), delivery.message.id, self._group_name()):
+        result = int(await self._redis.eval(
+            script, 5, self._message_key(delivery.message.id),
+            self._queue_key(delivery.message.queue, "leases"),
+            self._queue_key(delivery.message.queue, "stream"),
+            self._queue_key(delivery.message.queue, "expiry"),
+            self._queue_key(delivery.message.queue, "eq"), delivery.delivery_id,
+            delivery._lease_token, str(_timestamp(until)), delivery.message.id,
+            self._group_name(),
+        ))
+        if result == -1:
+            await self._emit_maintenance_event(
+                delivery.message.id, "expired", MessageStatus.EXPIRED.value,
+                reason="expired_during_lease_extension", metric_name="expired_total",
+            )
+            raise LeaseLostError("消息已过期")
+        if result != 1:
             raise LeaseLostError("租约已经失效，不能续租")
         return until
 
@@ -463,7 +543,7 @@ class RedisBroker:
         restored = 0
         for entry_id, fields in entries:
             message_id = fields["message_id"]
-            restored += int(await self._redis.eval(
+            moved = int(await self._redis.eval(
                 script,
                 3,
                 self._message_key(message_id),
@@ -473,7 +553,33 @@ class RedisBroker:
                 entry_id,
                 message_id,
             ))
+            restored += moved
+            if moved:
+                await self._emit_maintenance_event(message_id, "pel_recovered", MessageStatus.READY.value,
+                                                   reason="pending entry recovery", metric_name="reclaimed_total")
         return restored
+
+    async def _emit_maintenance_event(self, message_id: str, name: str, status: str, *,
+                                      reason: str | None = None, error_type: str | None = None,
+                                      metric_name: str | None = None) -> None:
+        """Publish a transition only after its Redis script has committed."""
+        try:
+            fields = await self._redis.hgetall(self._message_key(message_id))
+            if not fields:
+                return
+            message = self._decode(fields["envelope"], fields.get("serializer_name"), fields.get("serializer_version"))
+            if metric_name is not None:
+                await metric(self.metrics, metric_name, queue=message.queue)
+            await emit_event(
+                self.middleware, name, message, status=status,
+                delivery_id=fields.get("last_delivery_id") or fields.get("delivery_id") or None,
+                consumer_id=fields.get("last_consumer_id") or fields.get("consumer_id") or None,
+                attempt=int(fields.get("attempt", 0)), reason=reason,
+                error_type=error_type, backend="redis", event_sink=self.event_sink,
+                serializer_name=fields.get("serializer_name"), serializer_version=fields.get("serializer_version"),
+            )
+        except Exception:
+            logger.exception("taskflow failed to publish committed maintenance event", extra={"event": name})
 
     async def maintain(self, queue: str | None = None) -> int:
         """回收已到期租约，并把 READY/LEASED 的过期消息移入 EQ。"""
@@ -489,7 +595,7 @@ class RedisBroker:
             local expires = tonumber(redis.call('HGET', KEYS[1], 'expires_at') or '0')
             if expires > 0 and expires <= tonumber(ARGV[1]) then
               redis.call('HSET', KEYS[1], 'status', 'expired', 'last_action', 'expired', 'expired_at', ARGV[1], 'status_at_expiry', 'delayed', 'last_delivery_id', '')
-              redis.call('ZREM', KEYS[2], ARGV[2]); redis.call('ZREM', KEYS[3], ARGV[2]); redis.call('ZREM', KEYS[6], ARGV[2]); redis.call('LPUSH', KEYS[5], ARGV[2]); return 1
+              redis.call('ZREM', KEYS[2], ARGV[2]); redis.call('ZREM', KEYS[3], ARGV[2]); redis.call('ZREM', KEYS[6], ARGV[2]); redis.call('LPUSH', KEYS[5], ARGV[2]); return 2
             end
             local entry = redis.call('XADD', KEYS[4], '*', 'message_id', ARGV[2], 'envelope', redis.call('HGET', KEYS[1], 'envelope'))
             redis.call('HSET', KEYS[1], 'status', 'ready', 'entry_id', entry, 'available_at', '', 'last_action', 'due')
@@ -511,29 +617,48 @@ class RedisBroker:
             local expires = tonumber(redis.call('HGET', KEYS[1], 'expires_at') or '0')
             redis.call('XACK', KEYS[4], ARGV[2], entry); redis.call('XDEL', KEYS[4], entry); redis.call('ZREM', KEYS[2], ARGV[3])
             if expires > 0 and expires <= tonumber(ARGV[1]) then
-              redis.call('HSET', KEYS[1], 'status', 'expired', 'last_action', 'expired', 'expired_at', ARGV[1], 'status_at_expiry', 'leased', 'last_delivery_id', redis.call('HGET', KEYS[1], 'delivery_id') or ''); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until'); redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('LPUSH', KEYS[7], ARGV[3]); return 1
+              redis.call('HSET', KEYS[1], 'status', 'expired', 'last_action', 'expired', 'expired_at', ARGV[1], 'status_at_expiry', 'leased', 'last_delivery_id', redis.call('HGET', KEYS[1], 'delivery_id') or ''); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until'); redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('LPUSH', KEYS[7], ARGV[3]); return 3
             end
             local attempt = tonumber(redis.call('HGET', KEYS[1], 'attempt')); local maximum = tonumber(redis.call('HGET', KEYS[1], 'max_attempts'))
             if attempt >= maximum then
-              redis.call('HSET', KEYS[1], 'status', 'dead_lettered', 'dead_source', 'lease_timeout', 'last_action', 'lease_timeout', 'last_delivery_id', redis.call('HGET', KEYS[1], 'delivery_id') or ''); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until'); redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('LPUSH', KEYS[5], ARGV[3]); redis.call('HINCRBY', KEYS[6], 'dead_lettered_total', 1)
+              redis.call('HSET', KEYS[1], 'status', 'dead_lettered', 'dead_source', 'lease_timeout', 'last_action', 'lease_timeout', 'last_delivery_id', redis.call('HGET', KEYS[1], 'delivery_id') or ''); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until'); redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('LPUSH', KEYS[5], ARGV[3]); redis.call('HINCRBY', KEYS[6], 'dead_lettered_total', 1); return 2
             else
               local next_entry = redis.call('XADD', KEYS[4], '*', 'message_id', ARGV[3], 'envelope', redis.call('HGET', KEYS[1], 'envelope')); redis.call('HSET', KEYS[1], 'status', 'ready', 'entry_id', next_entry, 'last_action', 'reclaimed', 'last_delivery_id', redis.call('HGET', KEYS[1], 'delivery_id') or ''); redis.call('HDEL', KEYS[1], 'consumer_id', 'delivery_id', 'lease_token', 'claimed_at', 'lease_until'); redis.call('ZADD', KEYS[8], ARGV[1], ARGV[3]); redis.call('HINCRBY', KEYS[6], 'reclaimed_total', 1)
             end; return 1
         """
         for message_id in await self._redis.zrangebyscore(self._queue_key(queue, "delayed"), "-inf", _timestamp(now)):
-            reclaimed += int(await self._redis.eval(due_script, 6, self._message_key(message_id), self._queue_key(queue, "delayed"),
+            moved = int(await self._redis.eval(due_script, 6, self._message_key(message_id), self._queue_key(queue, "delayed"),
                 self._queue_key(queue, "ready"), self._queue_key(queue, "stream"), self._queue_key(queue, "eq"), self._queue_key(queue, "expiry"),
                 str(_timestamp(now)), message_id))
+            reclaimed += 1 if moved else 0
+            if moved == 1:
+                await self._emit_maintenance_event(message_id, "due", MessageStatus.READY.value)
+            elif moved == 2:
+                await self._emit_maintenance_event(message_id, "expired", MessageStatus.EXPIRED.value,
+                                                   reason="expired_from:delayed", metric_name="expired_total")
         for message_id in await self._redis.zrangebyscore(self._queue_key(queue, "expiry"), "-inf", _timestamp(now)):
-            await self._redis.eval(expire_script, 7, self._message_key(message_id), self._queue_key(queue, "leases"),
+            moved = int(await self._redis.eval(expire_script, 7, self._message_key(message_id), self._queue_key(queue, "leases"),
                                    self._queue_key(queue, "expiry"), self._queue_key(queue, "stream"), self._queue_key(queue, "eq"),
                                    self._queue_key(queue, "ready"), self._queue_key(queue, "delayed"),
-                                   str(_timestamp(now)), self._group_name(), message_id)
+                                   str(_timestamp(now)), self._group_name(), message_id))
+            if moved:
+                await self._emit_maintenance_event(message_id, "expired", MessageStatus.EXPIRED.value,
+                                                   reason="expired_by_maintenance", metric_name="expired_total")
         for message_id in await self._redis.zrangebyscore(self._queue_key(queue, "leases"), "-inf", _timestamp(now)):
             moved = await self._redis.eval(reclaim_script, 8, self._message_key(message_id), self._queue_key(queue, "leases"),
                                            self._queue_key(queue, "expiry"), self._queue_key(queue, "stream"), self._queue_key(queue, "dlq"),
                                            self._queue_key(queue, "stats"), self._queue_key(queue, "eq"), self._queue_key(queue, "ready"), str(_timestamp(now)), self._group_name(), message_id)
-            reclaimed += int(moved)
+            result = int(moved)
+            reclaimed += 1 if result else 0
+            if result == 1:
+                await self._emit_maintenance_event(message_id, "reclaimed", MessageStatus.READY.value,
+                                                   reason="lease_timeout", metric_name="reclaimed_total")
+            elif result == 2:
+                await self._emit_maintenance_event(message_id, "dead_lettered", MessageStatus.DEAD_LETTERED.value,
+                                                   reason="lease_timeout", metric_name="dead_lettered_total")
+            elif result == 3:
+                await self._emit_maintenance_event(message_id, "expired", MessageStatus.EXPIRED.value,
+                                                   reason="expired_from:leased", metric_name="expired_total")
         return reclaimed
 
     async def inspect(self, queue: str) -> QueueStats:
@@ -548,6 +673,7 @@ class RedisBroker:
         earliest = _datetime(float(first_ready[0][1])) if first_ready else None
         await metric(self.metrics, "queue_ready", float(ready), queue=queue)
         await metric(self.metrics, "queue_leased", float(leased), queue=queue)
+        await metric(self.metrics, "queue_delayed", float(delayed), queue=queue)
         return QueueStats(queue, int(ready), int(leased), int(dead_letters), int(expired), earliest,
                           int(stats.get("submitted_total", 0)), int(stats.get("acked_total", 0)), int(stats.get("retried_total", 0)), int(stats.get("reclaimed_total", 0)), int(stats.get("dead_lettered_total", 0)), int(delayed))
 

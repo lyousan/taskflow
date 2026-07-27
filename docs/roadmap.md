@@ -206,7 +206,7 @@ v0.3 解决“能运行”之外的架构一致性问题：不同队列可以有
 class QueueConfig:
     max_attempts: int = 3
     lease: timedelta = timedelta(minutes=5)
-    retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
+    retry_policy: RetryPolicy | None = None
     default_dedup_ttl: timedelta | None = None
     max_payload_bytes: int | None = None
 ```
@@ -290,6 +290,8 @@ class EventSink(Protocol):
 class MetricsSink(Protocol):
     async def increment(self, name: str, value: int = 1, **labels: str) -> None: ...
     async def observe(self, name: str, value: float, **labels: str) -> None: ...
+
+class GaugeMetricsSink(MetricsSink, Protocol):
     async def gauge(self, name: str, value: float, **labels: str) -> None: ...
 ```
 
@@ -355,7 +357,7 @@ registry.register("msgpack", "1", MsgpackSerializer())
 
 ## 5.1 版本目标
 
-v0.4 让 Taskflow 更适合中等规模应用：减少批量操作往返，提供类型化 payload，提供程序化和 CLI 管理能力，完善 DLQ/EQ replay。
+v0.4 让 Taskflow 更适合中等规模应用：减少批量操作往返，提供类型化 payload，提供程序化和 CLI 管理能力，完善 DLQ/EQ replay，并在继续扩展前完成核心实现的瘦身与去腐化。
 
 ## 5.2 功能范围
 
@@ -483,7 +485,34 @@ CLI 必须：
 - 显示 backend、namespace 和 queue；
 - 不打印 payload 中的敏感字段，除非用户显式要求。
 
+### F. 核心代码瘦身与去腐化
+
+v0.3 后 `SQLiteBroker` 与 `RedisBroker` 已同时承担连接生命周期、提交路由、状态迁移、维护、观测、管理入口以及（Redis）内联 Lua 脚本等职责。v0.4 在新增功能时必须同步拆解这些边界，禁止继续将新能力堆入单个 Broker 文件。
+
+目标结构与职责：
+
+- `broker/sqlite.py`、`broker/redis.py`：仅保留 backend 生命周期、依赖装配及公共入口；
+- `submission/`：Store、profile 路由、批量提交与 dedup 准入；
+- `broker/*_components.py` 或独立 state-machine 模块：Delivery / Consumer 与 ACK、retry、reject、lease 状态迁移；
+- `maintenance/`：delayed、expiry、lease reclaim、PEL recovery；
+- `observability/`：事件构造、指标映射和 sink 隔离；
+- Redis Lua 脚本移至具名、可单独测试的模块，避免在业务方法中内联大段字符串。
+
+约束：
+
+- 重构不得改变公开 API、持久化 schema、Redis key 格式或既有 at-least-once 语义；
+- SQLite 和 Redis 的同类状态迁移必须由参数化 backend conformance suite 覆盖；
+- 消除为绕过类型检查而新增的 `Any`、`cast` 和私有属性测试依赖；必要的动态边界应收敛到 adapter 层；
+- 每次拆分均需保持 lint、mypy、完整测试、构建及覆盖率门槛通过；
+- 新功能优先落到对应职责模块，不接受以“后续再拆”为由继续膨胀 Broker。
+
 ## 5.3 v0.4 验收标准
+
+- SQLite / Redis Broker 的生命周期、提交、投递状态机、maintenance 与 observability 职责已拆分，新增功能不再直接扩大核心 Broker 文件；
+- Redis Lua 脚本具有具名模块、独立单元测试及与 Python 调用参数一致的测试覆盖；
+- 存在参数化跨 backend conformance suite，至少覆盖 submit、retry、delayed、expiry、lease reclaim、DLQ/EQ、heartbeat、cancellation 与 stats；
+- 重构前已有公共 API、v0.2/v0.3 兼容行为、SQLite schema 与 Redis key 格式保持不变；
+- 新增或变更代码没有以 `Any`、无意义 `cast` 或私有实现细节测试来规避公开类型契约；
 
 - SQLite 批量提交有事务回滚测试和性能基准；
 - Redis 批量提交网络往返明显少于逐条版本；

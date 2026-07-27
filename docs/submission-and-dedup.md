@@ -100,7 +100,8 @@ class SubmissionStore(Protocol):
 
 Broker 默认分别使用 `SQLiteSubmissionStore` 与 `RedisStringDedupSubmissionStore`。也可用
 `submission_stores` 和 `queue_submission_profiles` 将不同队列路由到不同 profile；未配置
-queue 使用 `default`，混合 queue 的 `submit_many()` 按 profile 分组执行并保持输入顺序。
+queue 使用 `default`。单次 `submit_many()` 必须只涉及一个 profile；混合 profile 会在
+写入前以 `ValidationError` 拒绝，避免把一个调用拆成多个不可共同回滚的原子边界。
 每个 queue 的实际语义可通过 `submission_capabilities(queue)` 查询：
 
 ```python
@@ -117,7 +118,7 @@ broker = RedisBroker(
 
 自定义 Store 直接接收完整的 `PreparedSubmission`，因此可以实现自己的原子准入语义。
 `batch_submit` 表示支持批量 API，`batch_atomic` 表示同一 Store 的整批事务 / Lua 脚本
-原子性。混合 queue profile 会分组执行，因此整次调用不承诺跨 profile 原子性。
+原子性。跨 profile 批次不被接受，调用方应显式分批后分别处理结果。
 
 DLQ / EQ replay 默认 `reuse_dedup=True`，保留原 scope/key 与其记录。传入
 `reuse_dedup=False` 会移除原记录；同时提供新的 `dedup_scope`、`dedup_key` 和正数

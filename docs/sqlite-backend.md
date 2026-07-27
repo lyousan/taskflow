@@ -1,4 +1,4 @@
-# SQLite backend（v0.2）
+# SQLite backend（v0.3）
 
 `SQLiteBroker` 是本地脚本、测试与 CI 的持久化 backend。它以 SQLite 事务保护提交、
 领取、确认、重试、拒绝、租约回收和过期迁移的一致性，并通过异步 API 暴露全部 I/O

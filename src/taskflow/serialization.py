@@ -5,7 +5,7 @@ import json
 from collections.abc import Iterable
 from typing import Any, Protocol
 
-from .errors import ValidationError
+from .errors import SerializerUnavailableError, ValidationError
 
 
 class Serializer(Protocol):
@@ -46,11 +46,21 @@ class SerializerRegistry:
         for serializer in serializers:
             self.register(serializer)
 
-    def register(self, serializer: Serializer) -> None:
-        self._serializers[(serializer.name, serializer.version)] = serializer
+    def register(self, *args: Any) -> None:
+        """注册 serializer；支持 ``register(serializer)`` 和显式 name/version。"""
+        if len(args) == 1:
+            serializer = args[0]
+            name, version = serializer.name, serializer.version
+        elif len(args) == 3:
+            name, version, serializer = args
+        else:
+            raise TypeError("register(serializer) 或 register(name, version, serializer)")
+        if not isinstance(name, str) or not isinstance(version, str) or not name or not version:
+            raise ValidationError("serializer name/version 必须为非空字符串")
+        self._serializers[(name, version)] = serializer
 
     def resolve(self, name: str, version: str) -> Serializer:
         try:
             return self._serializers[(name, version)]
         except KeyError as exc:
-            raise ValidationError(f"未注册 serializer {name!r} v{version!r}") from exc
+            raise SerializerUnavailableError(f"未注册 serializer {name!r} v{version!r}") from exc
