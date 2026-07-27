@@ -1,13 +1,17 @@
 [project]
 name = "taskflow"
-version = "0.3.0"
+version = "0.4.0"
 description = "异步优先的可靠任务消息框架"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["aiosqlite>=0.20", "typing-extensions>=4.4"]
 
+[project.scripts]
+taskflow = "taskflow.cli:main"
+
 [project.optional-dependencies]
 redis = ["redis>=5.0"]
+pydantic = ["pydantic>=2,<3"]
 dev = [
     "mypy>=1.13",
     "pytest>=8.0",

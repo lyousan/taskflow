@@ -1,6 +1,6 @@
 # Taskflow
 
-Taskflow 是独立、可嵌入、异步优先的 Python 任务消息框架。v0.3 提供可靠的
+Taskflow 是独立、可嵌入、异步优先的 Python 任务消息框架。v0.4 提供可靠的
 至少一次投递、显式 ACK、延迟重试、租约回收、DLQ、EQ 与精确提交去重，以及可直接运行
 异步 handler 的高层 Worker。
 
@@ -81,6 +81,45 @@ asyncio.run(main())
 
 开发路线与版本验收标准见 [`docs/roadmap.md`](docs/roadmap.md)。
 v0.2 升级说明见 [`docs/migration-v0.2-v0.3.md`](docs/migration-v0.2-v0.3.md)。
+
+## v0.4：类型化 payload、批量提交与管理
+
+`submit()`、`worker()` 和 `run()` 均支持 `payload_type`。支持 dataclass、TypedDict
+和 Pydantic v2 model（安装 `taskflow[pydantic]`）；类型只约束 payload 的编码和解码，
+不改变 at-least-once 生命周期。TypedDict 的原始 `dict` 必须在提交时显式声明类型：
+
+```python
+class ResizePayload(TypedDict):
+    image_id: str
+    width: int
+    height: int
+
+await broker.submit(
+    queue="image.resize",
+    payload={"image_id": "img-1", "width": 800, "height": 600},
+    payload_type=ResizePayload,
+)
+worker = broker.worker("image.resize", handle_resize, payload_type=ResizePayload)
+```
+
+Taskflow 将 schema name/version 随 envelope 保存。worker 收到不匹配、字段缺失或类型
+损坏的类型化 payload 时，不会做隐式转换，而是以 `poison_payload` 原因进入 DLQ。
+Admin replay 覆盖 payload 时可传 `payload_type`；未声明类型的原始 dict 覆盖会清除旧 schema，
+避免类型元数据与实际 payload 不一致。为保持 v0.3 兼容，`payload=None` 表示保留原 payload；
+只有 `replace_payload=True, payload=None` 才会明确重放 JSON `null`。
+
+`submit_many(messages, atomic=True)` 在任一项无法准备或持久化时回滚整批。使用
+`atomic=False` 时返回与输入同序的 `BatchSubmitItemResult`；每项各自包含 `result` 或
+`error`，单项 validation、serializer、dedup 或 store 错误不会阻止后续项。
+
+DLQ/EQ replay 的 `dedup_mode` 为 `keep`、`remove` 或 `replace`：保留原记录、删除原记录，
+或以新的 scope/key/TTL 原子替换。破坏性 CLI 操作必须传 `--yes`。所有 CLI JSON 都显示
+backend、namespace 和 queue；SQLite 的 namespace 为 `null`。`taskflow health` 只是
+backend connectivity probe，并非完整系统健康检查；默认会隐藏 payload，只有
+`--include-payload` 才显示，输出可能包含敏感数据。
+
+完整行为、迁移和验收清单见 [v0.4 migration](docs/migration-v0.3-v0.4.md) 与
+[v0.4 acceptance](docs/v0.4-acceptance.md)。
 
 ## v0.3 配置与扩展点
 

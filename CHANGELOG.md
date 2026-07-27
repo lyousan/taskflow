@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- 新增 dataclass、TypedDict 和 Pydantic v2 类型化 payload 边界、schema identity 与 poison DLQ 路径。
+- 新增 `SubmitRequest.payload_type`、non-atomic 批量逐项结果 `BatchSubmitItemResult`，以及 SQLite/Redis 对称行为。
+- 新增 Admin inspect、DLQ/EQ replay 的 keep/remove/replace dedup 策略和安全 CLI。
+- replay payload override 现在使用与 submit 相同的归一化、schema 和 payload size 校验。
+- 保持 v0.3 `replay_dead_letter(payload=None)` 的“保留原 payload”语义；新增
+  `replace_payload=True` 以显式将 payload 改为 JSON `null`。
+- `TaskBroker` Protocol 同步 type payload API；Redis 以可选 extra 提供，Pydantic v2 以 `taskflow[pydantic]` 提供。
+
 ## 0.3.0
 
 - 新增按 queue 的 `QueueConfig` 与固定配置优先级。

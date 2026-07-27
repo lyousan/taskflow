@@ -59,6 +59,8 @@ class TaskMessage:
     expires_at: datetime | None = None
     max_attempts: int = 3
     available_at: datetime | None = None
+    payload_schema_name: str | None = None
+    payload_schema_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +78,7 @@ class SubmitRequest:
     workflow_id: str | None = None
     parent_id: str | None = None
     delay: timedelta | None = None
+    payload_type: type[Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +91,26 @@ class SubmitResult:
     existing_message_id: str | None = None
     stream_entry_id: str | None = None
     dedup_expires_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BatchSubmitItemResult:
+    """一项 non-atomic 批量提交的确定结果。
+
+    ``atomic=False`` 从不因为相邻项失败而中断。``error`` 保留该项在准备、
+    序列化或持久化阶段产生的原始异常，方便调用方按错误类型决定是否重试；
+    成功项的 ``result`` 不为 ``None``。
+    """
+
+    index: int
+    result: SubmitResult | None = None
+    error: Exception | None = None
+
+    @property
+    def accepted(self) -> bool:
+        """该项是否已被 broker 接受（重复提交返回 ``False``）。"""
+
+        return self.result is not None and self.result.accepted
 
 
 @dataclass(frozen=True, slots=True)

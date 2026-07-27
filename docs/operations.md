@@ -1,4 +1,4 @@
-# v0.3 Worker、配置、观测与 serializer
+# v0.4 Worker、配置、观测、类型化 payload 与管理
 
 ## QueueConfig 与扩展点
 
@@ -47,12 +47,46 @@ attempt、consumer、reason、serializer、status 与时间戳。
 消息选择 decoder。未注册的标识会以清晰的 `SerializerUnavailableError`（也是
 `ValidationError` 子类）失败，而不会尝试错误解码。
 
+## 类型化 payload 与排障
+
+dataclass、TypedDict 和 Pydantic v2 model 可通过 `payload_type` 绑定到 submit 和 worker。
+TypedDict 的提交值是普通 dict，必须显式声明 `payload_type`。类型化 worker 不会宽松转换字段：
+schema 不匹配或字段损坏会以 `poison_payload` 写入 DLQ，原始 envelope 仍可通过 Admin API 查看。
+Pydantic 是 optional extra（`taskflow[pydantic]`），正式支持范围是 v2；v1 不在兼容矩阵内。
+
+`submit_many(..., atomic=False)` 适合导入或背填：调用方必须逐项检查
+`BatchSubmitItemResult.result` 与 `.error`，不能假定整批都成功。`atomic=True` 适合要求整批
+rollback 的业务场景。两种 backend 都保持单条提交内部的 dedup、message、stream/index 原子边界。
+
+重放 DLQ/EQ 前应先 `inspect_message()`；使用 `dedup_mode=keep|remove|replace` 明确 dedup
+记录策略。payload override 可以传 `payload_type`，会执行与 submit 相同的 schema 和 payload
+size 校验。未类型化的 dict override 会清除旧 schema，以阻止错误类型标注。
+
+CLI 默认只读且会隐藏 payload。`taskflow dlq replay ... --yes` 是显式的破坏性操作；
+`--include-payload` 仅应在受控终端使用。每条输出带 backend、namespace（SQLite 为 null）和
+相关 queue。`taskflow health` 仅为 backend connectivity probe，不能当作索引、Consumer Group
+或业务 handler 的全量健康结论。
+
 完整的开发与 release 验证需同时安装开发工具和 Redis backend：
 
 ```bash
-uv sync --extra dev --extra redis --locked
+uv sync --extra dev --extra redis --extra pydantic --locked
 uv run ruff check src tests
 uv run mypy src tests
 uv run pytest --cov=taskflow -q
 uv build
 ```
+
+## v0.4 batch evidence
+
+SQLite batch-submit timing is intentionally a reproducible benchmark rather than a
+machine-dependent CI gate. Run it on the intended deployment host and record its
+output with the release evidence:
+
+```bash
+uv run python benchmarks/v04_batch_submit.py --count 1000
+```
+
+`tests/test_v04_batch_performance.py` separately proves the Redis network boundary:
+12 individual submissions perform 12 `EVAL` calls, while one `submit_many()` call
+performs exactly one `EVAL` call for the same 12 prepared submissions.

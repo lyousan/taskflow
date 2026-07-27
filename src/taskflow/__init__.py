@@ -11,6 +11,7 @@ from .config import QueueConfig
 from .errors import (
     BrokerClosedError,
     LeaseLostError,
+    PayloadDecodingError,
     RejectMessage,
     RetryableError,
     SerializerUnavailableError,
@@ -25,10 +26,12 @@ from .observability import (
     MetricsSink,
     TaskflowEvent,
 )
+from .payloads import PayloadSchema
 from .protocols import SubmissionStore, TaskBroker, TaskConsumer, TaskDelivery
 from .retry import ExponentialBackoff, FixedBackoff, ImmediateBackoff, RetryPolicy
 from .serialization import JsonSerializer, Serializer, SerializerRegistry
 from .types import (
+    BatchSubmitItemResult,
     ConsumerOptions,
     DeadLetter,
     ExpiredMessage,
@@ -44,6 +47,7 @@ from .worker import TaskWorker
 
 __all__ = [
     "BackendCapabilities",
+    "BatchSubmitItemResult",
     "BrokerClosedError",
     "BrokerEvent",
     "ConsumerOptions",
@@ -60,6 +64,8 @@ __all__ = [
     "LeaseLostError",
     "MessageStatus",
     "MetricsSink",
+    "PayloadDecodingError",
+    "PayloadSchema",
     "QueueConfig",
     "QueueStats",
     "RedisBroker",

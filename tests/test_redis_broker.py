@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import TypedDict
 from uuid import uuid4
 
 import pytest
@@ -26,6 +28,17 @@ from taskflow import (
 from tests.support import BinaryJsonSerializer
 
 pytest.importorskip("redis.asyncio")
+
+
+@dataclass(frozen=True)
+class TypedResize:
+    image_id: str
+    width: int
+
+
+class TypedResizeDict(TypedDict):
+    image_id: str
+    width: int
 
 
 async def clean(broker: RedisBroker) -> None:
@@ -101,6 +114,124 @@ async def test_redis_terminal_operations_are_idempotent(broker: RedisBroker) -> 
     current = await receive(broker)
     assert await current.reject(reason="bad") is FinishOutcome.DEAD_LETTERED
     assert await current.reject(reason="bad") is FinishOutcome.IDEMPOTENT
+
+
+@pytest.mark.asyncio
+async def test_v04_redis_typed_payloads_worker_poison_and_replay(broker: RedisBroker) -> None:
+    received: list[TypedResizeDict] = []
+    completed = asyncio.Event()
+
+    async def handler(message) -> None:  # type: ignore[no-untyped-def]
+        received.append(message.payload)
+        completed.set()
+
+    worker = broker.worker("jobs", handler, payload_type=TypedResizeDict,
+                           options=ConsumerOptions(lease_seconds=1, poll_interval=0.001))
+    await worker.start()
+    submitted = await broker.submit(queue="jobs", payload={"image_id": "ok", "width": 10},
+                                    payload_type=TypedResizeDict)
+    await asyncio.wait_for(completed.wait(), timeout=1)
+    await worker.close()
+    assert received == [{"image_id": "ok", "width": 10}]
+
+    invalid = await broker.submit(queue="jobs", payload={"image_id": "bad", "width": "10"})
+    poison_worker = broker.worker("jobs", handler, payload_type=TypedResizeDict,
+                                  options=ConsumerOptions(lease_seconds=1, poll_interval=0.001))
+    await poison_worker.start()
+    for _ in range(200):
+        if (await broker.inspect("jobs")).dead_letters == 1:
+            break
+        await asyncio.sleep(0.005)
+    await poison_worker.close()
+    assert (await broker.admin.list_dead_letters("jobs"))[0].message.id == invalid.message_id
+
+    await broker.admin.replay_dead_letter(
+        "jobs", invalid.message_id, payload=TypedResize("repaired", 20),
+        dedup_mode="remove",
+    )
+    replayed = await broker.inspect_message(invalid.message_id)
+    assert replayed is not None
+    assert replayed.payload == {"image_id": "repaired", "width": 20}
+    assert replayed.payload_schema_name == f"{TypedResize.__module__}.{TypedResize.__qualname__}"
+    assert submitted.accepted
+
+
+@pytest.mark.asyncio
+async def test_v04_redis_batch_modes_are_atomic_or_per_item(broker: RedisBroker) -> None:
+    atomic = await broker.submit_many([
+        SubmitRequest(queue="jobs", payload={"n": 1}),
+        SubmitRequest(queue="jobs", payload={"n": 2}),
+    ])
+    assert [item.accepted for item in atomic] == [True, True]
+
+    items = await broker.submit_many([
+        SubmitRequest(queue="jobs", payload={"n": 3}),
+        SubmitRequest(queue="bad queue!", payload={"n": 4}),
+        SubmitRequest(queue="jobs", payload={"n": 5}),
+    ], atomic=False)
+    assert [item.index for item in items] == [0, 1, 2]
+    assert items[0].result is not None and items[0].result.accepted
+    assert isinstance(items[1].error, ValidationError)
+    assert items[2].result is not None and items[2].result.accepted
+
+
+@pytest.mark.asyncio
+async def test_v03_replay_none_compatibility_and_explicit_null_override(broker: RedisBroker) -> None:
+    submitted = await broker.submit(queue="jobs", payload={"kept": True})
+    delivery = await receive(broker)
+    await delivery.reject(reason="repair")
+
+    await broker.admin.replay_dead_letter("jobs", submitted.message_id, payload=None, dedup_mode="remove")
+    preserved = await broker.inspect_message(submitted.message_id)
+    assert preserved is not None and preserved.payload == {"kept": True}
+
+    delivery = await receive(broker)
+    await delivery.reject(reason="repair again")
+    await broker.admin.replay_dead_letter(
+        "jobs", submitted.message_id, payload=None, replace_payload=True, dedup_mode="remove",
+    )
+    replaced = await broker.inspect_message(submitted.message_id)
+    assert replaced is not None and replaced.payload is None
+
+
+@pytest.mark.asyncio
+async def test_pydantic_typed_worker_success_and_poison_path(broker: RedisBroker) -> None:
+    pydantic = pytest.importorskip("pydantic")
+    Nested = pydantic.create_model("RedisNested", value=(int, ...))
+    Model = pydantic.create_model(
+        "RedisImageJob", image_id=(str, ...), created_at=(datetime, ...), nested=(Nested, ...), note=(str | None, None),
+    )
+    WrongVersion = pydantic.create_model(
+        "RedisImageJob", image_id=(str, ...), created_at=(datetime, ...), nested=(Nested, ...), note=(str | None, None),
+    )
+    WrongVersion.__taskflow_schema_version__ = "2"
+    handled = asyncio.Event()
+
+    async def handler(message) -> None:  # type: ignore[no-untyped-def]
+        assert isinstance(message.payload, Model)
+        handled.set()
+
+    worker = broker.worker("jobs", handler, payload_type=Model,
+                           options=ConsumerOptions(lease_seconds=1, poll_interval=0.001))
+    await worker.start()
+    await broker.submit(queue="jobs", payload=Model(
+        image_id="ok", created_at=datetime(2026, 1, 1, tzinfo=timezone.utc), nested={"value": 1}, note=None,
+    ))
+    await asyncio.wait_for(handled.wait(), timeout=1)
+    await worker.close()
+
+    poison_worker = broker.worker("jobs", handler, payload_type=WrongVersion,
+                                  options=ConsumerOptions(lease_seconds=1, poll_interval=0.001))
+    await poison_worker.start()
+    await broker.submit(queue="jobs", payload=Model(
+        image_id="bad", created_at=datetime(2026, 1, 1, tzinfo=timezone.utc), nested={"value": 2}, note=None,
+    ))
+    for _ in range(200):
+        if (await broker.inspect("jobs")).dead_letters == 1:
+            break
+        await asyncio.sleep(0.005)
+    await poison_worker.close()
+    assert (await broker.admin.list_dead_letters("jobs"))[0].reason == "poison_payload"
 
 
 @pytest.mark.asyncio

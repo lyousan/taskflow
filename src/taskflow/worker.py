@@ -5,12 +5,20 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
 
 from typing_extensions import Self
 
-from .errors import LeaseLostError, RejectMessage, RetryableError, ValidationError
+from .errors import (
+    LeaseLostError,
+    PayloadDecodingError,
+    RejectMessage,
+    RetryableError,
+    ValidationError,
+)
 from .observability import metric
+from .payloads import decode_payload
 from .retry import RetryPolicy
 from .types import ConsumerOptions, TaskMessage
 
@@ -31,7 +39,8 @@ class TaskWorker:
     def __init__(self, broker: TaskBroker, queue: str, handler: Handler, *, concurrency: int,
                  consumer_id: str | None = None, options: ConsumerOptions | None = None,
                  retry_policy: RetryPolicy | None = None,
-                 heartbeat_seconds: float | None = None) -> None:
+                 heartbeat_seconds: float | None = None,
+                 payload_type: type[Any] | None = None) -> None:
         if concurrency < 1:
             raise ValidationError("concurrency 必须大于等于 1")
         base = options or ConsumerOptions()
@@ -44,6 +53,7 @@ class TaskWorker:
         # None 保持 v0.1 Worker 的消息级 max_attempts 语义；显式策略才增加
         # 更严格的 Worker 上限和退避/异常分类。
         self._retry_policy = retry_policy
+        self._payload_type = payload_type
         self._heartbeat_seconds = heartbeat_seconds if heartbeat_seconds is not None else base.lease_seconds / 3
         self.concurrency, self._closed = concurrency, False
         self._consumers: list[TaskConsumer] = []
@@ -99,7 +109,14 @@ class TaskWorker:
         heartbeat = asyncio.create_task(self._heartbeat(delivery))
         try:
             started_at = time.perf_counter()
-            result = self._handler(delivery.message)
+            message = delivery.message
+            if self._payload_type is not None:
+                message = replace(message, payload=decode_payload(
+                    message.payload, self._payload_type,
+                    schema_name=message.payload_schema_name,
+                    schema_version=message.payload_schema_version,
+                ))
+            result = self._handler(message)
             if result is not None:
                 await result
         except asyncio.CancelledError:
@@ -107,6 +124,8 @@ class TaskWorker:
             raise
         except RejectMessage as exc:
             await delivery.reject(reason=_reason(exc), error=exc)
+        except PayloadDecodingError as exc:
+            await delivery.reject(reason="poison_payload", error=exc)
         except RetryableError as exc:
             await self._retry(delivery, exc)
         except Exception as exc:  # noqa: BLE001 - handler 异常必须有确定处理结果

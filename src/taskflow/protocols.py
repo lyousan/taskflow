@@ -1,15 +1,14 @@
 """面向扩展者的异步公共协议。"""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timedelta
-from typing import Any, Protocol
-
-from typing_extensions import Self
+from typing import TYPE_CHECKING, Any, Literal, Protocol, overload
 
 from .capabilities import BackendCapabilities, SubmissionCapabilities
 from .submission.base import PreparedSubmission
 from .types import (
+    BatchSubmitItemResult,
     ConsumerOptions,
     FinishOutcome,
     QueueStats,
@@ -17,6 +16,10 @@ from .types import (
     SubmitResult,
     TaskMessage,
 )
+
+if TYPE_CHECKING:
+    from .retry import RetryPolicy
+    from .worker import Handler, TaskWorker
 
 
 class TaskDelivery(Protocol):
@@ -41,7 +44,7 @@ class TaskConsumer(Protocol):
 
     async def start(self) -> None: ...
     async def close(self) -> None: ...
-    def __aiter__(self) -> Self: ...
+    def __aiter__(self) -> AsyncIterator[TaskDelivery]: ...
     async def __anext__(self) -> TaskDelivery: ...
 
 
@@ -57,21 +60,28 @@ class TaskBroker(Protocol):
         dedup_key: str | None = None, dedup_scope: str | None = None,
         dedup_ttl: timedelta | None = None, delay: timedelta | None = None, expires_at: datetime | None = None,
         max_attempts: int | None = None, workflow_id: str | None = None,
-        parent_id: str | None = None,
+        parent_id: str | None = None, payload_type: type[Any] | None = None,
     ) -> SubmitResult: ...
-    async def submit_many(self, messages: list[SubmitRequest]) -> list[SubmitResult]: ...
+    @overload
+    async def submit_many(self, messages: list[SubmitRequest], *, atomic: Literal[True] = True) -> list[SubmitResult]: ...
+    @overload
+    async def submit_many(self, messages: list[SubmitRequest], *, atomic: Literal[False]) -> list[BatchSubmitItemResult]: ...
+    async def submit_many(self, messages: list[SubmitRequest], *, atomic: bool = True) -> list[SubmitResult] | list[BatchSubmitItemResult]: ...
     def consumer(self, queue: str, *, consumer_id: str | None = None, options: ConsumerOptions | None = None) -> TaskConsumer: ...
     def worker(
-        self, queue: str, handler: Any, *, concurrency: int | None = None,
+        self, queue: str, handler: Handler, *, concurrency: int | None = None,
         consumer_id: str | None = None, options: ConsumerOptions | None = None,
-        retry_policy: Any | None = None, heartbeat_seconds: float | None = None,
-    ) -> Any: ...
+        retry_policy: RetryPolicy | None = None, heartbeat_seconds: float | None = None,
+        payload_type: type[Any] | None = None,
+    ) -> TaskWorker: ...
     async def run(
-        self, queue: str, handler: Any, *, concurrency: int | None = None,
+        self, queue: str, handler: Handler, *, concurrency: int | None = None,
         consumer_id: str | None = None, options: ConsumerOptions | None = None,
-        retry_policy: Any | None = None, heartbeat_seconds: float | None = None,
+        retry_policy: RetryPolicy | None = None, heartbeat_seconds: float | None = None,
+        payload_type: type[Any] | None = None,
     ) -> None: ...
     async def inspect(self, queue: str) -> QueueStats: ...
+    async def inspect_message(self, message_id: str) -> TaskMessage | None: ...
 
 
 class SubmissionStore(Protocol):

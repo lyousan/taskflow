@@ -21,6 +21,10 @@ class SerializerUnavailableError(ValidationError):
     """历史消息所需的 serializer 未注册或不可用。"""
 
 
+class PayloadDecodingError(TaskflowError):
+    """类型化 payload 不兼容；Worker 会将原始 envelope 作为 poison message 写入 DLQ。"""
+
+
 class BrokerClosedError(TaskflowError):
     """broker 或消费者已经关闭。"""
 

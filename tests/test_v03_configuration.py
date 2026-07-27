@@ -146,6 +146,28 @@ async def test_event_sink_receives_standard_fields() -> None:
 
 
 @pytest.mark.asyncio
+async def test_atomic_batch_reports_duplicate_through_submission_observer() -> None:
+    class Sink:
+        def __init__(self) -> None:
+            self.events: list[Any] = []
+
+        async def emit(self, item) -> None:  # type: ignore[no-untyped-def]
+            self.events.append(item)
+
+    sink = Sink()
+    async with SQLiteBroker(event_sink=sink) as broker:
+        await broker.submit(queue="jobs", payload={"id": 1}, dedup_scope="scope", dedup_key="first",
+                            dedup_ttl=timedelta(minutes=1))
+        results = await broker.submit_many([
+            SubmitRequest(queue="jobs", payload={"id": 2}, dedup_scope="scope", dedup_key="first",
+                          dedup_ttl=timedelta(minutes=1)),
+            SubmitRequest(queue="jobs", payload={"id": 3}),
+        ])
+    assert [item.event_name for item in sink.events] == ["submitted", "duplicate", "submitted"]
+    assert not results[0].accepted and results[1].accepted
+
+
+@pytest.mark.asyncio
 async def test_maintenance_events_are_published_after_state_commit() -> None:
     class Sink:
         def __init__(self) -> None:
