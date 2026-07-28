@@ -114,12 +114,27 @@ Admin replay 覆盖 payload 时可传 `payload_type`；未声明类型的原始 
 
 DLQ/EQ replay 的 `dedup_mode` 为 `keep`、`remove` 或 `replace`：保留原记录、删除原记录，
 或以新的 scope/key/TTL 原子替换。破坏性 CLI 操作必须传 `--yes`。所有 CLI JSON 都显示
-backend、namespace 和 queue；SQLite 的 namespace 为 `null`。`taskflow health` 只是
-backend connectivity probe，并非完整系统健康检查；默认会隐藏 payload，只有
+backend、namespace 和 queue；SQLite 的 namespace 为 `null`。`await broker.health_check()`
+返回结构化的连接、schema、索引/Consumer Group 和 serializer 诊断；命令行 `taskflow health`
+输出同一份报告，任一错误检查会返回非零状态。它不验证业务 handler、外部依赖或消息业务
+语义。默认会隐藏 payload，只有
 `--include-payload` 才显示，输出可能包含敏感数据。
 
 完整行为、迁移和验收清单见 [v0.4 migration](docs/migration-v0.3-v0.4.md) 与
 [v0.4 acceptance](docs/v0.4-acceptance.md)。
+
+## v0.5：生产诊断与一致性修复
+
+`check_consistency(queue)` 检查消息状态与 SQLite 审计表、或 Redis 的 ready/lease/delayed
+索引、DLQ/EQ、Stream 和 PEL 是否一致。`repair_consistency(queue)` 默认只返回 dry-run
+建议；必须显式传入 `dry_run=False` 才会修复安全的派生记录，绝不重放或删除业务 payload。
+CLI 对应 `taskflow queue check-consistency QUEUE` 和 `taskflow queue repair-consistency QUEUE`；
+实际修复需要 `--apply --yes`。
+
+升级、兼容和回滚见 [v0.5 migration](docs/migration-v0.4-v0.5.md)，完整发布验收项见
+[v0.5 acceptance](docs/v0.5-acceptance.md)。Taskflow 遵循 SemVer：v0.5 保持 v0.4 的公开 API
+兼容；废弃 API 会先在文档和 CHANGELOG 中声明。安全问题请参阅 [SECURITY.md](SECURITY.md)，
+贡献规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## v0.3 配置与扩展点
 

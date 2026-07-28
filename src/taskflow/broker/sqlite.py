@@ -13,7 +13,9 @@ import aiosqlite
 
 from ..capabilities import BackendCapabilities, SubmissionCapabilities
 from ..config import QueueConfig
-from ..errors import BrokerClosedError, ValidationError
+from ..consistency import ConsistencyIssue, ConsistencyReport, RepairReport
+from ..errors import BrokerClosedError, SerializerUnavailableError, ValidationError
+from ..health import HealthCheck, HealthReport
 from ..middleware import Middleware
 from ..naming import validate_persistent_name
 from ..observability import EventSink, MetricsSink, metric
@@ -46,10 +48,16 @@ from .sqlite_admin import SQLiteAdmin as _SQLiteAdmin
 from .sqlite_components import SQLiteConsumer, SQLiteDelivery
 from .sqlite_maintenance import MaintenanceEvent as _MaintenanceEvent
 from .sqlite_maintenance import SQLiteMaintenance
+from .sqlite_migrations import CURRENT_SQLITE_SCHEMA_VERSION, apply_sqlite_migrations
 from .sqlite_state_machine import SQLiteStateMachine
 
 BrokerT = TypeVar("BrokerT", bound="SQLiteBroker")
 logger = logging.getLogger(__name__)
+
+_SQLITE_SCHEMA_VERSION = str(CURRENT_SQLITE_SCHEMA_VERSION)
+_REQUIRED_SQLITE_INDEXES = frozenset({
+    "idx_messages_claim", "idx_messages_lease", "idx_messages_expiry",
+})
 
 
 class SQLiteBroker:
@@ -156,6 +164,9 @@ class SQLiteBroker:
                 acked_total INTEGER NOT NULL DEFAULT 0, retried_total INTEGER NOT NULL DEFAULT 0,
                 reclaimed_total INTEGER NOT NULL DEFAULT 0, dead_lettered_total INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS taskflow_schema (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL
+            );
         """)
         columns = {row[1] for row in await (await self._connection.execute("PRAGMA table_info(messages)")).fetchall()}
         if "serializer_name" not in columns:
@@ -169,6 +180,7 @@ class SQLiteBroker:
         if "available_at" not in columns:
             await self._connection.execute("ALTER TABLE messages ADD COLUMN available_at REAL")
         await self._connection.commit()
+        await apply_sqlite_migrations(self._connection)
 
     async def start(self) -> None:
         """提供与远程 backend 一致的显式生命周期入口。"""
@@ -482,6 +494,133 @@ class SQLiteBroker:
             row = await (await self._connection.execute(
                 "SELECT envelope, serializer_name, serializer_version FROM messages WHERE id=?", (message_id,))).fetchone()
         return None if row is None else self._decode_message(row["envelope"], row["serializer_name"], row["serializer_version"])
+
+    async def health_check(self) -> HealthReport:
+        """Run non-mutating checks for the SQLite connection and persisted data.
+
+        Unlike the v0.4 CLI probe this verifies the schema metadata, required
+        indexes and every serializer identity currently referenced by messages.
+        """
+
+        if self._closed:
+            return HealthReport(False, "sqlite", None, (
+                HealthCheck("connection", "error", "broker is closed"),
+            ))
+        try:
+            await self.start()
+            async with self._lock:
+                assert self._connection is not None
+                await (await self._connection.execute("SELECT 1")).fetchone()
+                version_row = await (await self._connection.execute(
+                    "SELECT value FROM taskflow_schema WHERE key='version'"
+                )).fetchone()
+                index_rows = await (await self._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'"
+                )).fetchall()
+                serializer_rows = await (await self._connection.execute(
+                    "SELECT DISTINCT serializer_name, serializer_version FROM messages"
+                )).fetchall()
+        except Exception as exc:  # noqa: BLE001 - report driver failures as diagnostics
+            return HealthReport(False, "sqlite", None, (
+                HealthCheck("connection", "error", f"{type(exc).__name__}: {exc}"),
+            ))
+
+        checks: list[HealthCheck] = [HealthCheck("connection", "ok")]
+        version = version_row["value"] if version_row is not None else None
+        checks.append(HealthCheck(
+            "schema_version", "ok" if version == _SQLITE_SCHEMA_VERSION else "error",
+            None if version == _SQLITE_SCHEMA_VERSION else f"expected {_SQLITE_SCHEMA_VERSION}, found {version!r}",
+        ))
+        indexes = {row["name"] for row in index_rows}
+        missing_indexes = sorted(_REQUIRED_SQLITE_INDEXES - indexes)
+        checks.append(HealthCheck(
+            "required_indexes", "ok" if not missing_indexes else "error",
+            None if not missing_indexes else f"missing: {', '.join(missing_indexes)}",
+        ))
+        unavailable: list[str] = []
+        for row in serializer_rows:
+            name, version = row["serializer_name"], row["serializer_version"]
+            try:
+                self.serializer_registry.resolve(name, version)
+            except SerializerUnavailableError:
+                unavailable.append(f"{name}@{version}")
+        checks.append(HealthCheck(
+            "serializer_registry", "ok" if not unavailable else "error",
+            None if not unavailable else f"unavailable: {', '.join(sorted(unavailable))}",
+        ))
+        checks.append(HealthCheck("namespace", "ok", "SQLite has no namespace"))
+        checks.append(HealthCheck(
+            "unrecoverable_errors", "ok" if not unavailable else "error",
+            None if not unavailable else "messages require unavailable serializers",
+        ))
+        return HealthReport(
+            all(check.status != "error" for check in checks), "sqlite", None, tuple(checks),
+        )
+
+    async def check_consistency(self, queue: str) -> ConsistencyReport:
+        """Inspect persisted status/audit invariants without changing user data."""
+
+        self._validate_queue(queue)
+        await self.start()
+        async with self._lock:
+            assert self._connection is not None
+            issues: list[ConsistencyIssue] = []
+            queries = (
+                ("missing_dead_letter", "SELECT id FROM messages m WHERE queue=? AND status='dead_lettered' AND NOT EXISTS (SELECT 1 FROM dead_letters d WHERE d.message_id=m.id)"),
+                ("orphan_dead_letter", "SELECT d.message_id FROM dead_letters d LEFT JOIN messages m ON m.id=d.message_id WHERE d.queue=? AND (m.id IS NULL OR m.status!='dead_lettered')"),
+                ("missing_expired", "SELECT id FROM messages m WHERE queue=? AND status='expired' AND NOT EXISTS (SELECT 1 FROM expired_messages e WHERE e.message_id=m.id)"),
+                ("orphan_expired", "SELECT e.message_id FROM expired_messages e LEFT JOIN messages m ON m.id=e.message_id WHERE e.queue=? AND (m.id IS NULL OR m.status!='expired')"),
+                ("leased_without_lease", "SELECT id FROM messages WHERE queue=? AND status='leased' AND (lease_until IS NULL OR delivery_id IS NULL OR lease_token IS NULL)"),
+            )
+            for name, query in queries:
+                rows = await (await self._connection.execute(query, (queue,))).fetchall()
+                issues.extend(ConsistencyIssue(name, row[0]) for row in rows)
+            index_rows = await (await self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'"
+            )).fetchall()
+            for name in sorted(_REQUIRED_SQLITE_INDEXES - {row[0] for row in index_rows}):
+                issues.append(ConsistencyIssue("missing_index", detail=name))
+        return ConsistencyReport(queue, "sqlite", None, tuple(issues))
+
+    async def repair_consistency(self, queue: str, *, dry_run: bool = True) -> RepairReport:
+        """Propose repairs by default; apply only audit/index repairs when explicit."""
+
+        report = await self.check_consistency(queue)
+        repairable = tuple(issue for issue in report.issues if issue.name != "leased_without_lease")
+        if dry_run or not repairable:
+            return RepairReport(queue, "sqlite", None, dry_run, repairable)
+        await self.start()
+        now = _timestamp(self._now())
+        async with self._lock:
+            assert self._connection is not None
+            cursor = await self._connection.cursor()
+            await cursor.execute("BEGIN IMMEDIATE")
+            try:
+                for issue in repairable:
+                    if issue.name == "missing_dead_letter":
+                        row = await (await cursor.execute("SELECT attempt FROM messages WHERE id=?", (issue.message_id,))).fetchone()
+                        if row is not None:
+                            await cursor.execute("INSERT OR IGNORE INTO dead_letters VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (issue.message_id, queue, row[0], "consistency_repair", "repair", now, None, None))
+                    elif issue.name == "missing_expired":
+                        row = await (await cursor.execute("SELECT attempt FROM messages WHERE id=?", (issue.message_id,))).fetchone()
+                        if row is not None:
+                            await cursor.execute("INSERT OR IGNORE INTO expired_messages VALUES (?, ?, ?, ?, ?)", (issue.message_id, queue, row[0], MessageStatus.EXPIRED.value, now))
+                    elif issue.name == "orphan_dead_letter":
+                        await cursor.execute("DELETE FROM dead_letters WHERE queue=? AND message_id=?", (queue, issue.message_id))
+                    elif issue.name == "orphan_expired":
+                        await cursor.execute("DELETE FROM expired_messages WHERE queue=? AND message_id=?", (queue, issue.message_id))
+                    elif issue.name == "missing_index" and issue.detail:
+                        definitions = {
+                            "idx_messages_claim": "CREATE INDEX IF NOT EXISTS idx_messages_claim ON messages(queue, status, created_at)",
+                            "idx_messages_lease": "CREATE INDEX IF NOT EXISTS idx_messages_lease ON messages(status, lease_until)",
+                            "idx_messages_expiry": "CREATE INDEX IF NOT EXISTS idx_messages_expiry ON messages(status, expires_at)",
+                        }
+                        await cursor.execute(definitions[issue.detail])
+                await cursor.execute("COMMIT")
+            except Exception:
+                await cursor.execute("ROLLBACK")
+                raise
+        return RepairReport(queue, "sqlite", None, False, repairable)
 
 
 # Compatibility export; the implementation belongs to submission.sqlite.

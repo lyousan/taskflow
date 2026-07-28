@@ -25,6 +25,11 @@ def main(argv: list[str] | None = None) -> int:
     queue = commands.add_parser("queue").add_subparsers(dest="queue_command", required=True)
     queue.add_parser("inspect").add_argument("queue")
     queue.add_parser("list-dead-letters").add_argument("queue")
+    queue.add_parser("check-consistency").add_argument("queue")
+    repair = queue.add_parser("repair-consistency")
+    repair.add_argument("queue")
+    repair.add_argument("--apply", action="store_true")
+    repair.add_argument("--yes", action="store_true")
     message = commands.add_parser("message").add_subparsers(dest="message_command", required=True)
     message.add_parser("inspect").add_argument("message_id")
     dlq = commands.add_parser("dlq").add_subparsers(dest="dlq_command", required=True)
@@ -41,6 +46,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValidationError as exc:
         print(f"taskflow: error: {exc}", file=sys.stderr)
         return 2
+    except Exception as exc:  # noqa: BLE001 - surface backend connection failures cleanly to operators
+        print(f"taskflow: backend unavailable: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -53,13 +61,23 @@ async def _run(args: argparse.Namespace) -> int:
                "namespace": args.namespace if args.redis_url else None}
     async with broker:
         if args.command == "health":
-            return _print({**context, "healthy": True, "probe": "backend_connectivity"}, args)
+            report = await broker.health_check()
+            _print(report, args)
+            return 0 if report.healthy else 1
         if args.command == "queue":
             if args.queue_command == "inspect":
                 return _print({**context, "queue": args.queue,
                                "stats": await broker.inspect(args.queue)}, args)
-            return _print({**context, "queue": args.queue,
-                           "dead_letters": await broker.admin.list_dead_letters(args.queue)}, args)
+            if args.queue_command == "list-dead-letters":
+                return _print({**context, "queue": args.queue,
+                               "dead_letters": await broker.admin.list_dead_letters(args.queue)}, args)
+            if args.queue_command == "check-consistency":
+                consistency_report = await broker.check_consistency(args.queue)
+                _print(consistency_report, args)
+                return 0 if consistency_report.consistent else 1
+            if args.apply and not args.yes:
+                raise ValidationError("修复一致性会改变持久化索引；请同时传入 --apply --yes")
+            return _print(await broker.repair_consistency(args.queue, dry_run=not args.apply), args)
         if args.command == "message":
             value = await broker.inspect_message(args.message_id)
             if value is None:

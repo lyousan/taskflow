@@ -8,6 +8,7 @@ from .broker import (
 )
 from .capabilities import BackendCapabilities, DedupGuarantee, SubmissionCapabilities
 from .config import QueueConfig
+from .consistency import ConsistencyIssue, ConsistencyReport, RepairReport
 from .errors import (
     BrokerClosedError,
     LeaseLostError,
@@ -19,6 +20,7 @@ from .errors import (
     UnsupportedCapabilityError,
     ValidationError,
 )
+from .health import HealthCheck, HealthReport
 from .observability import (
     BrokerEvent,
     EventSink,
@@ -50,6 +52,8 @@ __all__ = [
     "BatchSubmitItemResult",
     "BrokerClosedError",
     "BrokerEvent",
+    "ConsistencyIssue",
+    "ConsistencyReport",
     "ConsumerOptions",
     "DeadLetter",
     "DedupGuarantee",
@@ -59,6 +63,8 @@ __all__ = [
     "FinishOutcome",
     "FixedBackoff",
     "GaugeMetricsSink",
+    "HealthCheck",
+    "HealthReport",
     "ImmediateBackoff",
     "JsonSerializer",
     "LeaseLostError",
@@ -72,6 +78,7 @@ __all__ = [
     "RedisStringDedupSubmissionStore",
     "RedisSubmissionStore",
     "RejectMessage",
+    "RepairReport",
     "RetryPolicy",
     "RetryableError",
     "SQLiteBroker",

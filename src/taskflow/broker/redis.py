@@ -14,7 +14,9 @@ from typing_extensions import Self
 
 from ..capabilities import BackendCapabilities, SubmissionCapabilities
 from ..config import QueueConfig
-from ..errors import BrokerClosedError, ValidationError
+from ..consistency import ConsistencyIssue, ConsistencyReport, RepairReport
+from ..errors import BrokerClosedError, SerializerUnavailableError, ValidationError
+from ..health import HealthCheck, HealthReport
 from ..middleware import Middleware
 from ..naming import validate_persistent_name
 from ..observability import EventSink, MetricsSink, metric
@@ -60,6 +62,7 @@ from .redis_state_machine import RedisStateMachine
 logger = logging.getLogger(__name__)
 
 _CLOCK_SKEW_WARNING_SECONDS = 5.0
+_REDIS_SCHEMA_VERSION = "1"
 
 
 class RedisBroker:
@@ -82,6 +85,7 @@ class RedisBroker:
                  id_factory: Callable[[], str] = _new_id, middleware: Middleware | None = None,
                  metrics: MetricsSink | None = None,
                  pending_recovery_seconds: float = 1.0, submission_store: Any | None = None,
+                 consistency_pel_page_size: int = 1_000,
                  submission_stores: Mapping[str, Any] | None = None,
                  queue_submission_profiles: Mapping[str, str] | None = None,
                  queues: Mapping[str, QueueConfig] | None = None,
@@ -89,8 +93,10 @@ class RedisBroker:
                  events: EventSink | None = None,
                  allow_legacy_names: bool = False) -> None:
         if (isinstance(default_max_attempts, bool) or not isinstance(default_max_attempts, int)
-                or default_max_attempts < 1 or pending_recovery_seconds < 0):
-            raise ValidationError("default_max_attempts 必须大于等于 1，pending_recovery_seconds 不能为负数")
+                or default_max_attempts < 1 or pending_recovery_seconds < 0
+                or isinstance(consistency_pel_page_size, bool) or not isinstance(consistency_pel_page_size, int)
+                or consistency_pel_page_size < 1):
+            raise ValidationError("default_max_attempts 必须大于等于 1，pending_recovery_seconds 不能为负数，consistency_pel_page_size 必须为正数")
         validate_persistent_name(namespace, label="namespace", allow_legacy=allow_legacy_names)
         self._redis, self._namespace = redis, namespace
         self._allow_legacy_names = allow_legacy_names
@@ -104,6 +110,7 @@ class RedisBroker:
         self._serializer, self._id_factory = serializer or JsonSerializer(), id_factory
         self.serializer_registry = serializer_registry or SerializerRegistry([self._serializer])
         self._pending_recovery_ms = int(pending_recovery_seconds * 1000)
+        self._consistency_pel_page_size = consistency_pel_page_size
         if event_sink is not None and events is not None:
             raise ValidationError("event_sink 与 events 不能同时配置")
         self.middleware, self.metrics, self.event_sink, self._closed = middleware or Middleware(), metrics, event_sink or events, False
@@ -147,6 +154,9 @@ class RedisBroker:
 
     def _message_key(self, message_id: str) -> str:
         return f"{self._namespace}:message:{message_id}"
+
+    def _schema_key(self) -> str:
+        return f"{self._namespace}:meta:schema_version"
 
     def _dedup_key(self, scope: str, key: str) -> str:
         """以固定长度摘要构造 dedup key，隔离特殊字符与 Cluster hash tag。"""
@@ -193,6 +203,9 @@ class RedisBroker:
         """验证连接，避免首个业务提交才暴露连接配置错误。"""
         self._ensure_open()
         await self._redis.ping()
+        await self._redis.setnx(self._schema_key(), _REDIS_SCHEMA_VERSION)
+        for queue in self._queues:
+            await self._ensure_group(queue)
         if not self._clock_skew_checked:
             server_now = await self._now()
             skew_seconds = abs((utc_now() - server_now).total_seconds())
@@ -424,6 +437,288 @@ class RedisBroker:
         if not fields:
             return None
         return self._decode(fields["envelope"], fields.get("serializer_name"), fields.get("serializer_version"))
+
+    async def health_check(self) -> HealthReport:
+        """Run strictly read-only Redis diagnostics without claiming or modifying messages."""
+
+        if self._closed:
+            return HealthReport(False, "redis", self._namespace, (
+                HealthCheck("connection", "error", "broker is closed"),
+            ))
+        try:
+            await self._redis.ping()
+        except Exception as exc:  # noqa: BLE001 - report client failures as diagnostics
+            return HealthReport(False, "redis", self._namespace, (
+                HealthCheck("connection", "error", f"{type(exc).__name__}: {exc}"),
+            ))
+
+        checks: list[HealthCheck] = [HealthCheck("connection", "ok")]
+        try:
+            schema_version = await self._redis.get(self._schema_key())
+            schema_version = _as_text(schema_version) if schema_version is not None else None
+            checks.append(HealthCheck(
+                "schema_version", "ok" if schema_version == _REDIS_SCHEMA_VERSION else "error",
+                None if schema_version == _REDIS_SCHEMA_VERSION
+                else f"expected {_REDIS_SCHEMA_VERSION}, found {schema_version!r}",
+            ))
+        except Exception as exc:  # noqa: BLE001 - report client failures as diagnostics
+            checks.append(HealthCheck("schema_version", "error", f"{type(exc).__name__}: {exc}"))
+
+        checks.append(HealthCheck("namespace", "ok", self._namespace))
+        missing_configured_groups: list[str] = []
+        missing_dynamic_groups: list[str] = []
+        unavailable: list[str] = []
+        try:
+            stream_suffix = "}:stream"
+            stream_prefix = f"{self._namespace}:queue:{{"
+            queues = set(self._queues)
+            async for raw_key in self._redis.scan_iter(match=f"{self._namespace}:queue:*:stream"):
+                key = _as_text(raw_key)
+                if not key.startswith(stream_prefix) or not key.endswith(stream_suffix):
+                    continue
+                queues.add(key[len(stream_prefix):-len(stream_suffix)])
+            for queue in sorted(queues):
+                stream = self._queue_key(queue, "stream")
+                if not await self._redis.exists(stream):
+                    (missing_configured_groups if queue in self._queues else missing_dynamic_groups).append(queue)
+                    continue
+                groups = await self._redis.xinfo_groups(stream)
+                names = {_as_text(group.get("name", group.get(b"name"))) for group in groups}
+                if self._group_name() not in names:
+                    (missing_configured_groups if queue in self._queues else missing_dynamic_groups).append(queue)
+            checks.append(HealthCheck(
+                "consumer_groups", "error" if missing_configured_groups else "warning" if missing_dynamic_groups else "ok",
+                (f"missing configured group {self._group_name()!r}: {', '.join(missing_configured_groups)}" if missing_configured_groups
+                 else f"missing dynamic group {self._group_name()!r}: {', '.join(missing_dynamic_groups)}" if missing_dynamic_groups else None),
+            ))
+        except Exception as exc:  # noqa: BLE001 - report client failures as diagnostics
+            checks.append(HealthCheck("consumer_groups", "error", f"{type(exc).__name__}: {exc}"))
+
+        legacy_messages = 0
+        try:
+            async for raw_key in self._redis.scan_iter(match=f"{self._namespace}:message:*"):
+                fields = await self._redis.hgetall(raw_key)
+                raw_name = fields.get("serializer_name", fields.get(b"serializer_name"))
+                raw_version = fields.get("serializer_version", fields.get(b"serializer_version"))
+                if raw_name is None or raw_version is None:
+                    legacy_messages += 1
+                    continue
+                name, version = _as_text(raw_name), _as_text(raw_version)
+                try:
+                    self.serializer_registry.resolve(name, version)
+                except SerializerUnavailableError:
+                    unavailable.append(f"{name}@{version}")
+            checks.append(HealthCheck(
+                "serializer_registry", "ok" if not unavailable else "error",
+                None if not unavailable else f"unavailable: {', '.join(sorted(set(unavailable)))}",
+            ))
+            checks.append(HealthCheck(
+                "legacy_serializer_identity", "warning" if legacy_messages else "ok",
+                f"{legacy_messages} legacy JSON message(s) use the compatible default reader" if legacy_messages else None,
+            ))
+        except Exception as exc:  # noqa: BLE001 - report client failures as diagnostics
+            checks.append(HealthCheck("serializer_registry", "error", f"{type(exc).__name__}: {exc}"))
+
+        has_unrecoverable = any(check.name == "serializer_registry" and check.status == "error" for check in checks)
+        checks.append(HealthCheck(
+            "unrecoverable_errors", "error" if has_unrecoverable else "ok",
+            "messages require unavailable serializers" if has_unrecoverable else None,
+        ))
+        return HealthReport(
+            all(check.status != "error" for check in checks), "redis", self._namespace, tuple(checks),
+        )
+
+    async def check_consistency(self, queue: str) -> ConsistencyReport:
+        """Check Redis state hashes against all derived indexes and Stream state."""
+
+        self._validate_queue(queue)
+        await self._redis.ping()
+        keys = {kind: self._queue_key(queue, kind) for kind in ("ready", "leases", "delayed", "dlq", "eq", "stream")}
+        ready_ids = {_as_text(value) for value in await self._redis.zrange(keys["ready"], 0, -1)}
+        lease_ids = {_as_text(value) for value in await self._redis.zrange(keys["leases"], 0, -1)}
+        delayed_ids = {_as_text(value) for value in await self._redis.zrange(keys["delayed"], 0, -1)}
+        dlq_ids = [_as_text(value) for value in await self._redis.lrange(keys["dlq"], 0, -1)]
+        eq_ids = [_as_text(value) for value in await self._redis.lrange(keys["eq"], 0, -1)]
+        stream_entries = await self._redis.xrange(keys["stream"], "-", "+")
+        stream_by_id = {
+            _as_text(entry_id): _as_text(fields.get("message_id", fields.get(b"message_id")))
+            for entry_id, fields in stream_entries
+        }
+        stream_ids = set(stream_by_id.values())
+        pending_entry_ids: set[str] = set()
+        pending_available = True
+        try:
+            pending_entry_ids = await self._scan_pending_entry_ids(keys["stream"])
+        except Exception as exc:  # A missing group is separately reported by health_check().
+            pending_available = False
+            logger.debug("could not inspect Redis pending entries", exc_info=exc)
+
+        # Indexes alone are not a source of truth: a message can lose *all* its
+        # derived entries.  Include every hash belonging to this queue so that
+        # such total-loss corruption is still visible and repairable.
+        message_ids = ready_ids | lease_ids | delayed_ids | set(dlq_ids) | set(eq_ids) | stream_ids
+        message_fields: dict[str, Any] = {}
+        async for raw_key in self._redis.scan_iter(match=f"{self._namespace}:message:*"):
+            fields = await self._redis.hgetall(raw_key)
+            if _as_text(fields.get("queue", fields.get(b"queue"))) != queue:
+                continue
+            message_id = _as_text(raw_key).removeprefix(f"{self._namespace}:message:")
+            message_ids.add(message_id)
+            message_fields[message_id] = fields
+
+        issues: list[ConsistencyIssue] = []
+        for message_id in sorted(message_ids):
+            fields = message_fields.get(message_id)
+            if fields is None:
+                fields = await self._redis.hgetall(self._message_key(message_id))
+            if not fields:
+                issues.append(ConsistencyIssue("missing_message", message_id))
+                continue
+            status = _as_text(fields.get("status", fields.get(b"status")))
+            entry_id = _as_text(fields.get("entry_id", fields.get(b"entry_id")))
+            expected = {
+                "ready": (("ready_index", ready_ids), ("stream_entry", stream_ids)),
+                "leased": (("lease_index", lease_ids), ("stream_entry", stream_ids)),
+                "delayed": (("delayed_index", delayed_ids),),
+                "dead_lettered": (("dlq_entry", set(dlq_ids)),),
+                "expired": (("eq_entry", set(eq_ids)),),
+            }.get(status, ())
+            for name, values in expected:
+                if message_id not in values:
+                    issues.append(ConsistencyIssue(f"missing_{name}", message_id))
+            # The current entry ID, rather than merely any old entry for this
+            # message, is the one that may be safely claimed or acknowledged.
+            if status in {"ready", "leased"} and message_id in stream_ids and stream_by_id.get(entry_id) != message_id:
+                issues.append(ConsistencyIssue("stale_entry_id", message_id, entry_id))
+            if status == "leased" and pending_available and entry_id not in pending_entry_ids:
+                issues.append(ConsistencyIssue("missing_pel", message_id, entry_id))
+            if status != "ready" and message_id in ready_ids:
+                issues.append(ConsistencyIssue("orphan_ready_index", message_id))
+            if status != "leased" and message_id in lease_ids:
+                issues.append(ConsistencyIssue("orphan_lease_index", message_id))
+            if status != "delayed" and message_id in delayed_ids:
+                issues.append(ConsistencyIssue("orphan_delayed_index", message_id))
+            if status != "dead_lettered" and message_id in dlq_ids:
+                issues.append(ConsistencyIssue("orphan_dlq_entry", message_id))
+            if status != "expired" and message_id in eq_ids:
+                issues.append(ConsistencyIssue("orphan_eq_entry", message_id))
+        for name, audit_ids in (("duplicate_dlq_entry", dlq_ids), ("duplicate_eq_entry", eq_ids)):
+            issues.extend(ConsistencyIssue(name, message_id) for message_id in set(audit_ids) if audit_ids.count(message_id) > 1)
+        for entry_id in pending_entry_ids:
+            pending_message_id = stream_by_id.get(entry_id)
+            if pending_message_id is None:
+                issues.append(ConsistencyIssue("orphan_pel", detail=entry_id))
+                continue
+            fields = await self._redis.hgetall(self._message_key(pending_message_id))
+            if _as_text(fields.get("status", fields.get(b"status"))) != "leased":
+                issues.append(ConsistencyIssue("stale_pel", pending_message_id, entry_id))
+        return ConsistencyReport(queue, "redis", self._namespace, tuple(issues))
+
+    async def _scan_pending_entry_ids(self, stream: str) -> set[str]:
+        """Read the full PEL with exclusive-ID pagination, never a hidden cap."""
+
+        minimum = "-"
+        entry_ids: set[str] = set()
+        while True:
+            page = await self._redis.xpending_range(
+                stream, self._group_name(), minimum, "+", self._consistency_pel_page_size,
+            )
+            if not page:
+                return entry_ids
+            normalized = [_as_text(item.get("message_id", item.get(b"message_id"))) for item in page]
+            entry_ids.update(normalized)
+            if len(page) < self._consistency_pel_page_size:
+                return entry_ids
+            minimum = f"({normalized[-1]}"
+
+    async def repair_consistency(self, queue: str, *, dry_run: bool = True) -> RepairReport:
+        """Repair only derived Redis indexes; default dry-run never changes Redis."""
+
+        report = await self.check_consistency(queue)
+        repairable_names = {
+            "missing_ready_index", "missing_stream_entry", "stale_entry_id", "missing_lease_index",
+            "missing_delayed_index", "missing_dlq_entry", "missing_eq_entry", "orphan_ready_index",
+            "orphan_lease_index", "orphan_delayed_index", "orphan_dlq_entry", "orphan_eq_entry",
+            "duplicate_dlq_entry", "duplicate_eq_entry", "stale_pel", "orphan_pel",
+        }
+        repairable = tuple(issue for issue in report.issues if issue.name in repairable_names)
+        if dry_run:
+            return RepairReport(queue, "redis", self._namespace, True, repairable)
+        for issue in repairable:
+            if issue.name == "orphan_pel" and issue.detail:
+                await self._redis.xack(self._queue_key(queue, "stream"), self._group_name(), issue.detail)
+                continue
+            if issue.name == "stale_pel" and issue.detail:
+                await self._redis.xack(self._queue_key(queue, "stream"), self._group_name(), issue.detail)
+                continue
+            if issue.message_id is None:
+                continue
+            message_key = self._message_key(issue.message_id)
+            if issue.name == "missing_ready_index":
+                await self._redis.zadd(self._queue_key(queue, "ready"), {issue.message_id: _timestamp(await self._now())})
+            elif issue.name in {"missing_stream_entry", "stale_entry_id"}:
+                fields = await self._redis.hgetall(message_key)
+                # A leased message without its PEL is deliberately not rebuilt:
+                # fabricating a stream entry would invalidate its active lease.
+                if _as_text(fields.get("status", fields.get(b"status"))) != "ready":
+                    continue
+                if issue.name == "stale_entry_id":
+                    entries = await self._redis.xrange(self._queue_key(queue, "stream"), "-", "+")
+                    stale_ids = [entry_id for entry_id, entry_fields in entries if _as_text(
+                        entry_fields.get("message_id", entry_fields.get(b"message_id"))
+                    ) == issue.message_id]
+                    if stale_ids:
+                        await self._redis.xack(self._queue_key(queue, "stream"), self._group_name(), *stale_ids)
+                        await self._redis.xdel(self._queue_key(queue, "stream"), *stale_ids)
+                entry_id = await self._redis.xadd(
+                    self._queue_key(queue, "stream"),
+                    {"message_id": issue.message_id, "envelope": fields["envelope"]},
+                )
+                await self._redis.hset(message_key, mapping={"entry_id": entry_id})
+            elif issue.name == "missing_lease_index":
+                fields = await self._redis.hgetall(message_key)
+                await self._redis.zadd(self._queue_key(queue, "leases"), {issue.message_id: float(fields.get("lease_until", 0))})
+            elif issue.name == "missing_delayed_index":
+                fields = await self._redis.hgetall(message_key)
+                await self._redis.zadd(self._queue_key(queue, "delayed"), {issue.message_id: float(fields.get("available_at", 0))})
+            elif issue.name == "missing_dlq_entry":
+                await self._redis.lpush(self._queue_key(queue, "dlq"), issue.message_id)
+            elif issue.name == "missing_eq_entry":
+                await self._redis.lpush(self._queue_key(queue, "eq"), issue.message_id)
+            elif issue.name.startswith("orphan_ready"):
+                await self._redis.zrem(self._queue_key(queue, "ready"), issue.message_id)
+            elif issue.name.startswith("orphan_lease"):
+                await self._redis.zrem(self._queue_key(queue, "leases"), issue.message_id)
+            elif issue.name.startswith("orphan_delayed"):
+                await self._redis.zrem(self._queue_key(queue, "delayed"), issue.message_id)
+            elif issue.name.startswith("orphan_dlq") or issue.name == "duplicate_dlq_entry":
+                await self._redis.lrem(self._queue_key(queue, "dlq"), 0, issue.message_id)
+                fields = await self._redis.hgetall(message_key)
+                if _as_text(fields.get("status", fields.get(b"status"))) == "dead_lettered":
+                    await self._redis.lpush(self._queue_key(queue, "dlq"), issue.message_id)
+            elif issue.name.startswith("orphan_eq") or issue.name == "duplicate_eq_entry":
+                await self._redis.lrem(self._queue_key(queue, "eq"), 0, issue.message_id)
+                fields = await self._redis.hgetall(message_key)
+                if _as_text(fields.get("status", fields.get(b"status"))) == "expired":
+                    await self._redis.lpush(self._queue_key(queue, "eq"), issue.message_id)
+        return RepairReport(queue, "redis", self._namespace, False, repairable)
+
+    async def cleanup_deprecated_keys(self, *, dry_run: bool = True) -> tuple[str, ...]:
+        """List or remove the documented pre-v0.5 legacy key prefixes."""
+
+        await self.start()
+        keys: list[str] = []
+        for pattern in (f"{self._namespace}:legacy:*", f"{self._namespace}:v0:*"):
+            async for key in self._redis.scan_iter(match=pattern):
+                keys.append(_as_text(key))
+        selected = tuple(sorted(set(keys)))
+        if selected and not dry_run:
+            await self._redis.unlink(*selected)
+        return selected
+
+
+def _as_text(value: Any) -> str:
+    return value.decode() if isinstance(value, bytes) else str(value)
 
 
 # Compatibility exports; implementations belong to submission.redis.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+- 新增结构化 `health_check()`：检查 backend 连接、持久化 schema 版本、SQLite 必需索引、Redis Consumer Group、serializer registry 与 namespace 配置。
+- SQLite 与 Redis 分别开始持久化 schema/keyspace version，作为后续可回滚迁移和滚动升级的基础。
+- `taskflow health` 现在输出完整诊断结果，并在任一错误检查失败时以非零状态退出。
+- 新增跨 SQLite/Redis 的只读 `check_consistency()` 与显式 `repair_consistency()`；修复默认 dry-run，CLI 写入操作需要 `--apply --yes`。
+
 ## 0.4.0
 
 - 新增 dataclass、TypedDict 和 Pydantic v2 类型化 payload 边界、schema identity 与 poison DLQ 路径。

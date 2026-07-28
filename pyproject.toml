@@ -1,8 +1,9 @@
 [project]
 name = "taskflow"
-version = "0.4.0"
+version = "0.5.0.dev0"
 description = "异步优先的可靠任务消息框架"
 readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = ["aiosqlite>=0.20", "typing-extensions>=4.4"]
 
@@ -33,6 +34,9 @@ packages = ["src/taskflow"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "redis: requires a reachable Redis server; never silently skipped in release CI",
+]
 
 [tool.coverage.report]
 fail_under = 85

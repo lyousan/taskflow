@@ -41,7 +41,7 @@ class ResizeDict(TypedDict):
     width: int
 
 
-@pytest.fixture(params=("sqlite", "redis"))
+@pytest.fixture(params=("sqlite", pytest.param("redis", marks=pytest.mark.redis)))
 async def broker(request: pytest.FixtureRequest, tmp_path: Path) -> AsyncIterator[Broker]:
     if request.param == "sqlite":
         async with SQLiteBroker(tmp_path / "conformance-v04.db") as instance:

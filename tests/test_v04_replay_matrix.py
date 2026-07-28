@@ -14,7 +14,7 @@ from taskflow.types import utc_now
 Broker = SQLiteBroker | RedisBroker
 
 
-@pytest.fixture(params=("sqlite", "redis"))
+@pytest.fixture(params=("sqlite", pytest.param("redis", marks=pytest.mark.redis)))
 async def broker(request: pytest.FixtureRequest, tmp_path: Path) -> AsyncIterator[Broker]:
     if request.param == "sqlite":
         async with SQLiteBroker(tmp_path / "replay-v04.db") as sqlite_broker:

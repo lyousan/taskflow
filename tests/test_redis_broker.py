@@ -15,6 +15,7 @@ from taskflow import (
     FinishOutcome,
     JsonSerializer,
     LeaseLostError,
+    QueueConfig,
     RedisBroker,
     RedisStringDedupSubmissionStore,
     RedisSubmissionStore,
@@ -28,6 +29,7 @@ from taskflow import (
 from tests.support import BinaryJsonSerializer
 
 pytest.importorskip("redis.asyncio")
+pytestmark = pytest.mark.redis
 
 
 @dataclass(frozen=True)
@@ -114,6 +116,125 @@ async def test_redis_terminal_operations_are_idempotent(broker: RedisBroker) -> 
     current = await receive(broker)
     assert await current.reject(reason="bad") is FinishOutcome.DEAD_LETTERED
     assert await current.reject(reason="bad") is FinishOutcome.IDEMPOTENT
+
+
+@pytest.mark.asyncio
+async def test_v05_redis_health_reports_schema_and_consumer_group(broker: RedisBroker) -> None:
+    await broker.submit(queue="jobs", payload={})
+    delivery = await broker.consumer("jobs").__anext__()
+    await delivery.ack()
+
+    report = await broker.health_check()
+    checks = {check.name: check for check in report.checks}
+    assert report.healthy
+    assert checks["schema_version"].status == "ok"
+    assert checks["consumer_groups"].status == "ok"
+
+    await broker._redis.set(broker._schema_key(), "999")
+    incompatible = await broker.health_check()
+    incompatible_checks = {check.name: check for check in incompatible.checks}
+    assert not incompatible.healthy
+    assert incompatible_checks["schema_version"].status == "error"
+
+
+@pytest.mark.asyncio
+async def test_v05_redis_health_is_read_only_and_reports_missing_configured_group(broker: RedisBroker, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def unexpected_write(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("health check must not initialize Redis")
+
+    monkeypatch.setattr(broker._redis, "setnx", unexpected_write)
+    monkeypatch.setattr(broker._redis, "xgroup_create", unexpected_write)
+    readonly_report = await broker.health_check()
+    assert readonly_report.healthy
+
+    configured = RedisBroker(broker._redis, namespace=broker._namespace, queues={"configured": QueueConfig()})
+    report = await configured.health_check()
+    checks = {check.name: check for check in report.checks}
+    assert not report.healthy
+    assert checks["consumer_groups"].status == "error"
+    assert "configured" in (checks["consumer_groups"].detail or "")
+
+
+@pytest.mark.asyncio
+async def test_v05_redis_consistency_dry_run_and_repair(broker: RedisBroker) -> None:
+    submitted = await broker.submit(queue="jobs", payload={})
+    await broker._redis.zrem(broker._queue_key("jobs", "ready"), submitted.message_id)
+
+    report = await broker.check_consistency("jobs")
+    assert ("missing_ready_index", submitted.message_id) in {(issue.name, issue.message_id) for issue in report.issues}
+    proposed = await broker.repair_consistency("jobs")
+    assert proposed.dry_run
+    assert await broker._redis.zscore(broker._queue_key("jobs", "ready"), submitted.message_id) is None
+    await broker.repair_consistency("jobs", dry_run=False)
+    assert (await broker.check_consistency("jobs")).consistent
+
+    fields = await broker._redis.hgetall(broker._message_key(submitted.message_id))
+    await broker._redis.xdel(broker._queue_key("jobs", "stream"), fields["entry_id"])
+    assert any(issue.name == "missing_stream_entry" for issue in (await broker.check_consistency("jobs")).issues)
+    await broker.repair_consistency("jobs", dry_run=False)
+    assert (await broker.check_consistency("jobs")).consistent
+
+    repaired_fields = await broker._redis.hgetall(broker._message_key(submitted.message_id))
+    await broker._redis.zrem(broker._queue_key("jobs", "ready"), submitted.message_id)
+    await broker._redis.xdel(broker._queue_key("jobs", "stream"), repaired_fields["entry_id"])
+    lost_all_indexes = await broker.check_consistency("jobs")
+    assert {"missing_ready_index", "missing_stream_entry"} <= {issue.name for issue in lost_all_indexes.issues}
+    await broker.repair_consistency("jobs", dry_run=False)
+    assert (await broker.check_consistency("jobs")).consistent
+
+
+@pytest.mark.asyncio
+async def test_v05_redis_consistency_scans_pel_beyond_first_thousand_entries(broker: RedisBroker) -> None:
+    queue = "pel-audit"
+    stream = broker._queue_key(queue, "stream")
+    await broker._redis.xgroup_create(stream, broker._group_name(), id="0", mkstream=True)
+    total = 1_002
+    for index in range(total):
+        await broker._redis.xadd(stream, {"message_id": f"raw-{index}", "envelope": "unused"})
+    received = await broker._redis.xreadgroup(
+        broker._group_name(), "audit", {stream: ">"}, count=total,
+    )
+    entries = received[0][1]
+    stale_entry_id = entries[-2][0]
+    orphan_entry_id = entries[-1][0]
+    stale_message_id = "raw-1000"
+    await broker._redis.hset(broker._message_key(stale_message_id), mapping={
+        "queue": queue, "status": "ready", "entry_id": stale_entry_id,
+    })
+    await broker._redis.xdel(stream, orphan_entry_id)
+
+    report = await broker.check_consistency(queue)
+    assert ("stale_pel", stale_message_id, stale_entry_id) in {
+        (issue.name, issue.message_id, issue.detail) for issue in report.issues
+    }
+    assert ("orphan_pel", None, orphan_entry_id) in {
+        (issue.name, issue.message_id, issue.detail) for issue in report.issues
+    }
+
+
+
+@pytest.mark.asyncio
+async def test_v05_redis_cleanup_deprecated_keys_is_explicit(broker: RedisBroker) -> None:
+    legacy = f"{broker._namespace}:legacy:old-message"
+    await broker._redis.set(legacy, "obsolete")
+    assert await broker.cleanup_deprecated_keys() == (legacy,)
+    assert await broker._redis.exists(legacy)
+    assert await broker.cleanup_deprecated_keys(dry_run=False) == (legacy,)
+    assert not await broker._redis.exists(legacy)
+
+
+@pytest.mark.asyncio
+async def test_v05_redis_reads_legacy_message_without_serializer_identity(broker: RedisBroker) -> None:
+    submitted = await broker.submit(queue="jobs", payload={"legacy": True})
+    await broker._redis.hdel(broker._message_key(submitted.message_id), "serializer_name", "serializer_version")
+    inspected = await broker.inspect_message(submitted.message_id)
+    assert inspected is not None and inspected.payload == {"legacy": True}
+    report = await broker.health_check()
+    checks = {check.name: check for check in report.checks}
+    assert report.healthy
+    assert checks["serializer_registry"].status == "ok"
+    assert checks["legacy_serializer_identity"].status == "warning"
+    assert checks["unrecoverable_errors"].status == "ok"
 
 
 @pytest.mark.asyncio
@@ -635,6 +756,9 @@ def test_redis_namespace_must_be_a_safe_persistent_identifier() -> None:
             RedisBroker(UnusedRedis(), namespace=namespace)
 
     assert RedisBroker(UnusedRedis(), namespace="_legacy", allow_legacy_names=True)._namespace == "_legacy"
+    assert RedisBroker(UnusedRedis(), consistency_pel_page_size=17)._consistency_pel_page_size == 17
+    with pytest.raises(ValidationError, match="consistency_pel_page_size"):
+        RedisBroker(UnusedRedis(), consistency_pel_page_size=0)
 
 
 @pytest.mark.asyncio

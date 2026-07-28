@@ -1,5 +1,20 @@
 # v0.4 Worker、配置、观测、类型化 payload 与管理
 
+## v0.5 诊断、修复与升级
+
+`health_check()` 是严格只读诊断：不会写 schema key、创建 Consumer Group、claim 或 repair。首次 `start()`
+或显式初始化才会写入 schema/version 并为配置 queue 建立 Consumer Group。health 对缺失的配置 queue group
+报告 error；动态 queue 尚未消费时的 group 缺失为 warning。先运行 `health_check()`，再对每个活跃 queue 运行 `check_consistency(queue)`。repair 默认 dry-run；只有
+`dry_run=False` 或 CLI `--apply --yes` 才可写入。自动修复仅限派生 Redis index/Stream、SQLite 审计条目与缺失索引；
+leased 消息 PEL 丢失、未知 hash、schema 不匹配和 serializer 不可用只诊断，必须停止 worker、保留备份并人工处置。
+
+Redis PEL consistency audit 使用 `XPENDING RANGE` 的 exclusive-ID 分页扫描至空页；不设隐式总数上限。
+`RedisBroker(..., consistency_pel_page_size=1000)` 可调节每页大小，仅影响单次读取的资源使用，不会截断报告。
+
+Redis 在 `start()` 为已配置 queue 创建 Consumer Group，动态 queue 在首次消费时初始化。历史 Redis message 缺失
+serializer identity 时按 JSON reader 读取，并在 health 中显示为可兼容 warning，不是不可恢复错误。`cleanup_deprecated_keys()` 只匹配 `<namespace>:legacy:*` 和
+`<namespace>:v0:*`，默认 dry-run。性能数据和容量边界见 [v0.5 benchmark](benchmark-v0.5.md)。
+
 ## QueueConfig 与扩展点
 
 每个 broker 可以通过 `queues={"queue-name": QueueConfig(...)}` 配置队列默认策略：
