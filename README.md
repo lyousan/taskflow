@@ -165,3 +165,8 @@ uv build
 
 扩展开发者可从顶层导入 `TaskBroker`、`TaskConsumer`、`TaskDelivery` 与
 `SubmissionStore` Protocol。
+
+## 示例
+
+常见场景的可独立运行示例见 [`examples/`](examples/README.md)：SQLite/Redis Worker、重试与延迟、
+批量与 dedup、类型化 payload、显式 Delivery、DLQ 重放，以及 v0.5 health/consistency 诊断。
