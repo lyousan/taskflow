@@ -1,9 +1,11 @@
 """面向本地开发与 CI 的 SQLite Taskflow backend。"""
+
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +21,7 @@ from ..health import HealthCheck, HealthReport
 from ..middleware import Middleware
 from ..naming import validate_persistent_name
 from ..observability import EventSink, MetricsSink, metric
+from ..pagination import decode_cursor, encode_cursor, validate_page_limit
 from ..payloads import PAYLOAD_UNSET, normalize_payload, reconstruct_payload
 from ..retry import RetryPolicy
 from ..serialization import JsonSerializer, Serializer, SerializerRegistry
@@ -33,7 +36,10 @@ from ..types import (
     BatchSubmitItemResult,
     ConsumerOptions,
     FinishOutcome,
+    MessageState,
     MessageStatus,
+    MessageSummary,
+    Page,
     QueueStats,
     SubmitRequest,
     SubmitResult,
@@ -55,9 +61,13 @@ BrokerT = TypeVar("BrokerT", bound="SQLiteBroker")
 logger = logging.getLogger(__name__)
 
 _SQLITE_SCHEMA_VERSION = str(CURRENT_SQLITE_SCHEMA_VERSION)
-_REQUIRED_SQLITE_INDEXES = frozenset({
-    "idx_messages_claim", "idx_messages_lease", "idx_messages_expiry",
-})
+_REQUIRED_SQLITE_INDEXES = frozenset(
+    {
+        "idx_messages_claim",
+        "idx_messages_lease",
+        "idx_messages_expiry",
+    }
+)
 
 
 class SQLiteBroker:
@@ -72,6 +82,9 @@ class SQLiteBroker:
         high_throughput=False,
         batch_submit=True,
         batch_atomic=True,
+        paginated_observation=True,
+        stable_pagination_cursors=True,
+        message_status_filter=True,
     )
 
     def __init__(
@@ -94,7 +107,11 @@ class SQLiteBroker:
         events: EventSink | None = None,
         allow_legacy_names: bool = False,
     ) -> None:
-        if isinstance(default_max_attempts, bool) or not isinstance(default_max_attempts, int) or default_max_attempts < 1:
+        if (
+            isinstance(default_max_attempts, bool)
+            or not isinstance(default_max_attempts, int)
+            or default_max_attempts < 1
+        ):
             raise ValidationError("default_max_attempts 必须大于等于 1")
         self._database = str(database)
         self._connection: aiosqlite.Connection | None = None
@@ -104,23 +121,34 @@ class SQLiteBroker:
         self._allow_legacy_names = allow_legacy_names
         self._default_max_attempts = default_max_attempts
         self._default_dedup_ttl = default_dedup_ttl
-        self._default_queue_config = QueueConfig(max_attempts=default_max_attempts, default_dedup_ttl=default_dedup_ttl)
+        self._default_queue_config = QueueConfig(
+            max_attempts=default_max_attempts, default_dedup_ttl=default_dedup_ttl
+        )
         self._queues = dict(queues or {})
         for queue, config in self._queues.items():
-            validate_persistent_name(queue, label="queue", allow_legacy=self._allow_legacy_names)
+            validate_persistent_name(
+                queue, label="queue", allow_legacy=self._allow_legacy_names
+            )
             if not isinstance(config, QueueConfig):
                 raise ValidationError("queues 的值必须是 QueueConfig")
         self._serializer = serializer or JsonSerializer()
-        self.serializer_registry = serializer_registry or SerializerRegistry([self._serializer])
+        self.serializer_registry = serializer_registry or SerializerRegistry(
+            [self._serializer]
+        )
         self.middleware = middleware or Middleware()
         self.metrics = metrics
         if event_sink is not None and events is not None:
             raise ValidationError("event_sink 与 events 不能同时配置")
         self.event_sink = event_sink or events
-        self._configure_submission_stores(submission_store, submission_stores, queue_submission_profiles)
+        self._configure_submission_stores(
+            submission_store, submission_stores, queue_submission_profiles
+        )
         self._submission_observer = SubmissionObserver(
-            backend="sqlite", middleware=self.middleware, metrics=self.metrics,
-            event_sink=self.event_sink, serializer=self._serializer,
+            backend="sqlite",
+            middleware=self.middleware,
+            metrics=self.metrics,
+            event_sink=self.event_sink,
+            serializer=self._serializer,
         )
         self._submission_service = SubmissionService(self, self._prepare_submission)
         self._maintenance = SQLiteMaintenance(self)
@@ -168,17 +196,32 @@ class SQLiteBroker:
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             );
         """)
-        columns = {row[1] for row in await (await self._connection.execute("PRAGMA table_info(messages)")).fetchall()}
+        columns = {
+            row[1]
+            for row in await (
+                await self._connection.execute("PRAGMA table_info(messages)")
+            ).fetchall()
+        }
         if "serializer_name" not in columns:
-            await self._connection.execute("ALTER TABLE messages ADD COLUMN serializer_name TEXT NOT NULL DEFAULT 'json'")
+            await self._connection.execute(
+                "ALTER TABLE messages ADD COLUMN serializer_name TEXT NOT NULL DEFAULT 'json'"
+            )
         if "serializer_version" not in columns:
-            await self._connection.execute("ALTER TABLE messages ADD COLUMN serializer_version TEXT NOT NULL DEFAULT '1'")
+            await self._connection.execute(
+                "ALTER TABLE messages ADD COLUMN serializer_version TEXT NOT NULL DEFAULT '1'"
+            )
         if "last_delivery_id" not in columns:
-            await self._connection.execute("ALTER TABLE messages ADD COLUMN last_delivery_id TEXT")
+            await self._connection.execute(
+                "ALTER TABLE messages ADD COLUMN last_delivery_id TEXT"
+            )
         if "last_consumer_id" not in columns:
-            await self._connection.execute("ALTER TABLE messages ADD COLUMN last_consumer_id TEXT")
+            await self._connection.execute(
+                "ALTER TABLE messages ADD COLUMN last_consumer_id TEXT"
+            )
         if "available_at" not in columns:
-            await self._connection.execute("ALTER TABLE messages ADD COLUMN available_at REAL")
+            await self._connection.execute(
+                "ALTER TABLE messages ADD COLUMN available_at REAL"
+            )
         await self._connection.commit()
         await apply_sqlite_migrations(self._connection)
 
@@ -189,7 +232,9 @@ class SQLiteBroker:
         if self._connection is None:
             async with self._start_lock:
                 if self._connection is None:
-                    connection = await aiosqlite.connect(self._database, isolation_level=None)
+                    connection = await aiosqlite.connect(
+                        self._database, isolation_level=None
+                    )
                     connection.row_factory = aiosqlite.Row
                     self._connection = connection
                     await self._initialize()
@@ -199,8 +244,8 @@ class SQLiteBroker:
 
         if not self._closed:
             async with self._lock:
-                assert self._connection is not None
-                await self._connection.close()
+                if self._connection is not None:
+                    await self._connection.close()
                 self._closed = True
 
     async def __aenter__(self: BrokerT) -> BrokerT:
@@ -214,6 +259,27 @@ class SQLiteBroker:
         if self._closed:
             raise BrokerClosedError("broker 已关闭")
 
+    @asynccontextmanager
+    async def _read_connection(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Yield an existing connection or a transient SQLite read-only connection."""
+
+        self._ensure_open()
+        if self._connection is not None:
+            async with self._lock:
+                yield self._connection
+            return
+        if self._database == ":memory:":
+            raise ValidationError("未启动的内存 SQLite broker 没有可观察的持久化数据")
+        database_uri = f"{Path(self._database).resolve().as_uri()}?mode=ro"
+        connection = await aiosqlite.connect(
+            database_uri, uri=True, isolation_level=None
+        )
+        connection.row_factory = aiosqlite.Row
+        try:
+            yield connection
+        finally:
+            await connection.close()
+
     def _now(self) -> datetime:
         value = self._clock()
         if value.tzinfo is None:
@@ -221,18 +287,26 @@ class SQLiteBroker:
         return value.astimezone(timezone.utc)
 
     def _validate_queue(self, queue: str) -> None:
-        validate_persistent_name(queue, label="queue", allow_legacy=self._allow_legacy_names)
+        validate_persistent_name(
+            queue, label="queue", allow_legacy=self._allow_legacy_names
+        )
 
     def _queue_config(self, queue: str) -> QueueConfig:
         self._validate_queue(queue)
         return self._queues.get(queue, self._default_queue_config)
 
-    def _configure_submission_stores(self, submission_store: Any | None,
-                                     submission_stores: Mapping[str, Any] | None,
-                                     queue_submission_profiles: Mapping[str, str] | None) -> None:
+    def _configure_submission_stores(
+        self,
+        submission_store: Any | None,
+        submission_stores: Mapping[str, Any] | None,
+        queue_submission_profiles: Mapping[str, str] | None,
+    ) -> None:
         self._submission_router = SubmissionRouter(
-            self, default_store=_SQLiteSubmissionStore(self), submission_store=submission_store,
-            submission_stores=submission_stores, queue_submission_profiles=queue_submission_profiles,
+            self,
+            default_store=_SQLiteSubmissionStore(self),
+            submission_store=submission_store,
+            submission_stores=submission_stores,
+            queue_submission_profiles=queue_submission_profiles,
         )
         self._submission_stores = self._submission_router.stores
         self._queue_submission_profiles = self._submission_router.profiles
@@ -242,62 +316,141 @@ class SQLiteBroker:
         """返回该 queue 实际路由到的 SubmissionStore 能力声明。"""
         self._validate_queue(queue)
         profile = self._submission_router.profile_for(queue)
-        return self.submission_store.capabilities if profile == "default" else self._submission_router.capabilities(queue)
+        return (
+            self.submission_store.capabilities
+            if profile == "default"
+            else self._submission_router.capabilities(queue)
+        )
 
     def _submission_store_for(self, queue: str) -> Any:
-        return self.submission_store if self._submission_router.profile_for(queue) == "default" else self._submission_router.for_queue(queue)
+        return (
+            self.submission_store
+            if self._submission_router.profile_for(queue) == "default"
+            else self._submission_router.for_queue(queue)
+        )
 
     def _message_json(self, message: TaskMessage) -> bytes:
-        return self._serializer.dumps({
-            "id": message.id, "queue": message.queue, "payload": message.payload,
-            "metadata": dict(message.metadata), "dedup_key": message.dedup_key,
-            "dedup_scope": message.dedup_scope, "workflow_id": message.workflow_id,
-            "parent_id": message.parent_id, "created_at": _timestamp(message.created_at),
-            "available_at": _timestamp(message.available_at) if message.available_at else None,
-            "expires_at": _timestamp(message.expires_at) if message.expires_at else None,
-            "max_attempts": message.max_attempts,
-            "payload_schema_name": message.payload_schema_name,
-            "payload_schema_version": message.payload_schema_version,
-        })
+        return self._serializer.dumps(
+            {
+                "id": message.id,
+                "queue": message.queue,
+                "payload": message.payload,
+                "metadata": dict(message.metadata),
+                "dedup_key": message.dedup_key,
+                "dedup_scope": message.dedup_scope,
+                "workflow_id": message.workflow_id,
+                "parent_id": message.parent_id,
+                "created_at": _timestamp(message.created_at),
+                "available_at": _timestamp(message.available_at)
+                if message.available_at
+                else None,
+                "expires_at": _timestamp(message.expires_at)
+                if message.expires_at
+                else None,
+                "max_attempts": message.max_attempts,
+                "payload_schema_name": message.payload_schema_name,
+                "payload_schema_version": message.payload_schema_version,
+            }
+        )
 
-    def _decode_message(self, envelope: bytes, serializer_name: str | None = None,
-                        serializer_version: str | None = None) -> TaskMessage:
-        decoder = self._serializer if serializer_name is None or (serializer_name == self._serializer.name and serializer_version == self._serializer.version) else self.serializer_registry.resolve(serializer_name, serializer_version or "")
+    def _decode_message(
+        self,
+        envelope: bytes,
+        serializer_name: str | None = None,
+        serializer_version: str | None = None,
+    ) -> TaskMessage:
+        decoder = (
+            self._serializer
+            if serializer_name is None
+            or (
+                serializer_name == self._serializer.name
+                and serializer_version == self._serializer.version
+            )
+            else self.serializer_registry.resolve(
+                serializer_name, serializer_version or ""
+            )
+        )
         data = decoder.loads(envelope)
         return TaskMessage(
-            id=data["id"], queue=data["queue"], payload=data["payload"], metadata=data["metadata"],
-            dedup_key=data["dedup_key"], dedup_scope=data["dedup_scope"], workflow_id=data["workflow_id"],
-            parent_id=data["parent_id"], created_at=_datetime(data["created_at"]) or utc_now(),
+            id=data["id"],
+            queue=data["queue"],
+            payload=data["payload"],
+            metadata=data["metadata"],
+            dedup_key=data["dedup_key"],
+            dedup_scope=data["dedup_scope"],
+            workflow_id=data["workflow_id"],
+            parent_id=data["parent_id"],
+            created_at=_datetime(data["created_at"]) or utc_now(),
             available_at=_datetime(data.get("available_at")),
-            expires_at=_datetime(data["expires_at"]), max_attempts=data["max_attempts"],
+            expires_at=_datetime(data["expires_at"]),
+            max_attempts=data["max_attempts"],
             payload_schema_name=data.get("payload_schema_name"),
             payload_schema_version=data.get("payload_schema_version"),
         )
 
-    async def submit(self, *, queue: str, payload: Any, metadata: Mapping[str, Any] | None = None,
-                     dedup_key: str | None = None, dedup_scope: str | None = None,
-                     dedup_ttl: timedelta | None = None, delay: timedelta | None = None, expires_at: datetime | None = None,
-                     max_attempts: int | None = None, workflow_id: str | None = None,
-                     parent_id: str | None = None, payload_type: type[Any] | None = None) -> SubmitResult:
+    async def submit(
+        self,
+        *,
+        queue: str,
+        payload: Any,
+        metadata: Mapping[str, Any] | None = None,
+        dedup_key: str | None = None,
+        dedup_scope: str | None = None,
+        dedup_ttl: timedelta | None = None,
+        delay: timedelta | None = None,
+        expires_at: datetime | None = None,
+        max_attempts: int | None = None,
+        workflow_id: str | None = None,
+        parent_id: str | None = None,
+        payload_type: type[Any] | None = None,
+    ) -> SubmitResult:
         """构造完整 PreparedSubmission 并委托 SubmissionStore 进入原子边界。"""
         return await self._submission_service.submit(
-            queue=queue, payload=payload, metadata=metadata, dedup_key=dedup_key, dedup_scope=dedup_scope,
-            dedup_ttl=dedup_ttl, delay=delay, expires_at=expires_at, max_attempts=max_attempts,
-            workflow_id=workflow_id, parent_id=parent_id, payload_type=payload_type,
+            queue=queue,
+            payload=payload,
+            metadata=metadata,
+            dedup_key=dedup_key,
+            dedup_scope=dedup_scope,
+            dedup_ttl=dedup_ttl,
+            delay=delay,
+            expires_at=expires_at,
+            max_attempts=max_attempts,
+            workflow_id=workflow_id,
+            parent_id=parent_id,
+            payload_type=payload_type,
         )
 
-    async def _prepare_submission(self, *, queue: str, payload: Any, metadata: Mapping[str, Any] | None = None,
-                     dedup_key: str | None = None, dedup_scope: str | None = None,
-                     dedup_ttl: timedelta | None = None, delay: timedelta | None = None, expires_at: datetime | None = None,
-                     max_attempts: int | None = None, workflow_id: str | None = None,
-                     parent_id: str | None = None, payload_type: type[Any] | None = None) -> tuple[PreparedSubmission, TaskMessage]:
+    async def _prepare_submission(
+        self,
+        *,
+        queue: str,
+        payload: Any,
+        metadata: Mapping[str, Any] | None = None,
+        dedup_key: str | None = None,
+        dedup_scope: str | None = None,
+        dedup_ttl: timedelta | None = None,
+        delay: timedelta | None = None,
+        expires_at: datetime | None = None,
+        max_attempts: int | None = None,
+        workflow_id: str | None = None,
+        parent_id: str | None = None,
+        payload_type: type[Any] | None = None,
+    ) -> tuple[PreparedSubmission, TaskMessage]:
         """校验请求、生成 ID 并序列化；不在此处执行持久化。"""
         self._ensure_open()
         self._validate_queue(queue)
         if (dedup_key is None) != (dedup_scope is None):
             raise ValidationError("dedup_key 与 dedup_scope 必须同时提供")
         config = self._queue_config(queue)
-        ttl = (config.default_dedup_ttl if queue in self._queues else self._default_dedup_ttl) if dedup_ttl is None else dedup_ttl
+        ttl = (
+            (
+                config.default_dedup_ttl
+                if queue in self._queues
+                else self._default_dedup_ttl
+            )
+            if dedup_ttl is None
+            else dedup_ttl
+        )
         if ttl is not None and not isinstance(ttl, timedelta):
             raise ValidationError("dedup_ttl 必须是 timedelta")
         if dedup_key is not None and (ttl is None or ttl.total_seconds() <= 0):
@@ -321,41 +474,81 @@ class SQLiteBroker:
         else:
             initial_status = MessageStatus.READY
         encoded_payload, schema = normalize_payload(payload, payload_type=payload_type)
-        message = TaskMessage(self._id_factory(), queue, encoded_payload, metadata or {}, dedup_key, dedup_scope,
-                              workflow_id, parent_id, now, expires_at, attempts, available_at,
-                              schema.name if schema else None, schema.version if schema else None)
+        message = TaskMessage(
+            self._id_factory(),
+            queue,
+            encoded_payload,
+            metadata or {},
+            dedup_key,
+            dedup_scope,
+            workflow_id,
+            parent_id,
+            now,
+            expires_at,
+            attempts,
+            available_at,
+            schema.name if schema else None,
+            schema.version if schema else None,
+        )
         envelope = self._message_json(message)
-        if config.max_payload_bytes is not None and len(self._serializer.dumps(encoded_payload)) > config.max_payload_bytes:
-            raise ValidationError(f"payload 超过 queue {queue!r} 的 max_payload_bytes 限制")
-        prepared = PreparedSubmission(message.id, queue, envelope, initial_status.value, now,
-            int(_timestamp(expires_at) * 1000) if expires_at else None, dedup_scope, dedup_key,
-            int(ttl.total_seconds() * 1000) if ttl else None, attempts,
-            self._serializer.name, self._serializer.version,
-            int(_timestamp(available_at) * 1000) if available_at else None)
+        if (
+            config.max_payload_bytes is not None
+            and len(self._serializer.dumps(encoded_payload)) > config.max_payload_bytes
+        ):
+            raise ValidationError(
+                f"payload 超过 queue {queue!r} 的 max_payload_bytes 限制"
+            )
+        prepared = PreparedSubmission(
+            message.id,
+            queue,
+            envelope,
+            initial_status.value,
+            now,
+            int(_timestamp(expires_at) * 1000) if expires_at else None,
+            dedup_scope,
+            dedup_key,
+            int(ttl.total_seconds() * 1000) if ttl else None,
+            attempts,
+            self._serializer.name,
+            self._serializer.version,
+            int(_timestamp(available_at) * 1000) if available_at else None,
+        )
         return prepared, message
 
     @overload
-    async def submit_many(self, messages: list[SubmitRequest], *, atomic: Literal[True] = True) -> list[SubmitResult]: ...
+    async def submit_many(
+        self, messages: list[SubmitRequest], *, atomic: Literal[True] = True
+    ) -> list[SubmitResult]: ...
 
     @overload
-    async def submit_many(self, messages: list[SubmitRequest], *, atomic: Literal[False]) -> list[BatchSubmitItemResult]: ...
+    async def submit_many(
+        self, messages: list[SubmitRequest], *, atomic: Literal[False]
+    ) -> list[BatchSubmitItemResult]: ...
 
-    async def submit_many(self, messages: list[SubmitRequest], *, atomic: bool = True) -> list[SubmitResult] | list[BatchSubmitItemResult]:
+    async def submit_many(
+        self, messages: list[SubmitRequest], *, atomic: bool = True
+    ) -> list[SubmitResult] | list[BatchSubmitItemResult]:
         """批量提交；non-atomic 模式对每一项独立准备、提交并返回结果。"""
 
         return await self._submission_service.submit_many(messages, atomic=atomic)
 
-    async def _record_submitted(self, prepared: PreparedSubmission, message: TaskMessage,
-                                result: SubmitResult) -> None:
+    async def _record_submitted(
+        self, prepared: PreparedSubmission, message: TaskMessage, result: SubmitResult
+    ) -> None:
         """在持久化成功后发出统一的提交观测事件。"""
 
         await self._submission_observer.record(prepared, message, result)
 
-    def _reconstruct_replay_message(self, message: TaskMessage, *, queue: str,
-                                    payload: Any = PAYLOAD_UNSET,
-                                    payload_type: type[Any] | None = None,
-                                    metadata: Mapping[str, Any] | None = None,
-                                    expires_at: datetime | None | object = PAYLOAD_UNSET) -> TaskMessage:
+    def _reconstruct_replay_message(
+        self,
+        message: TaskMessage,
+        *,
+        queue: str,
+        payload: Any = PAYLOAD_UNSET,
+        payload_type: type[Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        expires_at: datetime | None | object = PAYLOAD_UNSET,
+    ) -> TaskMessage:
         """Rebuild a replayed envelope through the same payload boundary as submit."""
 
         encoded, schema_name, schema_version = reconstruct_payload(
@@ -372,76 +565,163 @@ class SQLiteBroker:
             assert expires_at is None or isinstance(expires_at, datetime)
             replayed_expires_at = expires_at
         replayed = replace(
-            message, queue=queue, payload=encoded,
+            message,
+            queue=queue,
+            payload=encoded,
             metadata=message.metadata if metadata is None else metadata,
             expires_at=replayed_expires_at,
-            payload_schema_name=schema_name, payload_schema_version=schema_version,
+            payload_schema_name=schema_name,
+            payload_schema_version=schema_version,
         )
         self._validate_queue(replayed.queue)
         config = self._queue_config(replayed.queue)
-        if config.max_payload_bytes is not None and len(self._serializer.dumps(encoded)) > config.max_payload_bytes:
-            raise ValidationError(f"payload 超过 queue {replayed.queue!r} 的 max_payload_bytes 限制")
+        if (
+            config.max_payload_bytes is not None
+            and len(self._serializer.dumps(encoded)) > config.max_payload_bytes
+        ):
+            raise ValidationError(
+                f"payload 超过 queue {replayed.queue!r} 的 max_payload_bytes 限制"
+            )
         # Validate metadata and the complete envelope before the replay transaction starts.
         self._message_json(replayed)
         return replayed
 
-    def consumer(self, queue: str, *, consumer_id: str | None = None,
-                 options: ConsumerOptions | None = None) -> SQLiteConsumer:
+    def consumer(
+        self,
+        queue: str,
+        *,
+        consumer_id: str | None = None,
+        options: ConsumerOptions | None = None,
+    ) -> SQLiteConsumer:
         """创建一个显式 ACK 的异步消费者。"""
 
         self._ensure_open()
         self._validate_queue(queue)
-        selected = options or ConsumerOptions(lease_seconds=self._queue_config(queue).lease.total_seconds())
-        if selected.lease_seconds <= 0 or selected.poll_interval < 0 or selected.concurrency < 1:
+        selected = options or ConsumerOptions(
+            lease_seconds=self._queue_config(queue).lease.total_seconds()
+        )
+        if (
+            selected.lease_seconds <= 0
+            or selected.poll_interval < 0
+            or selected.concurrency < 1
+        ):
             raise ValidationError("消费者参数必须有效")
         return SQLiteConsumer(self, queue, consumer_id or self._id_factory(), selected)
 
-    def worker(self, queue: str, handler: Handler, *, concurrency: int | None = None,
-               consumer_id: str | None = None, options: ConsumerOptions | None = None,
-               retry_policy: RetryPolicy | None = None, heartbeat_seconds: float | None = None,
-               payload_type: type[Any] | None = None) -> TaskWorker:
+    def worker(
+        self,
+        queue: str,
+        handler: Handler,
+        *,
+        concurrency: int | None = None,
+        consumer_id: str | None = None,
+        options: ConsumerOptions | None = None,
+        retry_policy: RetryPolicy | None = None,
+        heartbeat_seconds: float | None = None,
+        payload_type: type[Any] | None = None,
+    ) -> TaskWorker:
         """创建一个真正受 ``concurrency`` 限制的 Worker。"""
-        selected = options or ConsumerOptions(lease_seconds=self._queue_config(queue).lease.total_seconds())
+        selected = options or ConsumerOptions(
+            lease_seconds=self._queue_config(queue).lease.total_seconds()
+        )
         if retry_policy is None and queue in self._queues:
             retry_policy = self._queue_config(queue).retry_policy
-        return TaskWorker(self, queue, handler, concurrency=concurrency if concurrency is not None else selected.concurrency,
-                          consumer_id=consumer_id, options=selected, retry_policy=retry_policy,
-                          heartbeat_seconds=heartbeat_seconds, payload_type=payload_type)
+        return TaskWorker(
+            self,
+            queue,
+            handler,
+            concurrency=concurrency
+            if concurrency is not None
+            else selected.concurrency,
+            consumer_id=consumer_id,
+            options=selected,
+            retry_policy=retry_policy,
+            heartbeat_seconds=heartbeat_seconds,
+            payload_type=payload_type,
+        )
 
-    async def run(self, queue: str, handler: Handler, *, concurrency: int | None = None,
-                  consumer_id: str | None = None, options: ConsumerOptions | None = None,
-                  retry_policy: RetryPolicy | None = None,
-                  heartbeat_seconds: float | None = None,
-                  payload_type: type[Any] | None = None) -> None:
+    async def run(
+        self,
+        queue: str,
+        handler: Handler,
+        *,
+        concurrency: int | None = None,
+        consumer_id: str | None = None,
+        options: ConsumerOptions | None = None,
+        retry_policy: RetryPolicy | None = None,
+        heartbeat_seconds: float | None = None,
+        payload_type: type[Any] | None = None,
+    ) -> None:
         """运行 Worker，直到调用方取消任务或调用 Worker.close()。"""
-        await self.worker(queue, handler, concurrency=concurrency, consumer_id=consumer_id,
-                          options=options, retry_policy=retry_policy,
-                          heartbeat_seconds=heartbeat_seconds, payload_type=payload_type).run()
+        await self.worker(
+            queue,
+            handler,
+            concurrency=concurrency,
+            consumer_id=consumer_id,
+            options=options,
+            retry_policy=retry_policy,
+            heartbeat_seconds=heartbeat_seconds,
+            payload_type=payload_type,
+        ).run()
 
-    async def _claim(self, queue: str, consumer_id: str, lease_seconds: float) -> SQLiteDelivery | None:
+    async def _claim(
+        self, queue: str, consumer_id: str, lease_seconds: float
+    ) -> SQLiteDelivery | None:
         return await self._state_machine.claim(queue, consumer_id, lease_seconds)
 
     async def _counter(self, cursor: aiosqlite.Cursor, queue: str, column: str) -> None:
         await self._state_machine.counter(cursor, queue, column)
 
-    async def _dead_letter(self, cursor: aiosqlite.Cursor, row: aiosqlite.Row, now: datetime, source: str,
-                           reason: str | None, error: BaseException | None = None,
-                           *, last_action: str | None = None) -> None:
-        await self._state_machine.dead_letter(cursor, row, now, source, reason, error, last_action=last_action)
+    async def _dead_letter(
+        self,
+        cursor: aiosqlite.Cursor,
+        row: aiosqlite.Row,
+        now: datetime,
+        source: str,
+        reason: str | None,
+        error: BaseException | None = None,
+        *,
+        last_action: str | None = None,
+    ) -> None:
+        await self._state_machine.dead_letter(
+            cursor, row, now, source, reason, error, last_action=last_action
+        )
 
-    async def _expire(self, cursor: aiosqlite.Cursor, message_id: str, now: datetime, old_status: MessageStatus, attempt: int) -> None:
+    async def _expire(
+        self,
+        cursor: aiosqlite.Cursor,
+        message_id: str,
+        now: datetime,
+        old_status: MessageStatus,
+        attempt: int,
+    ) -> None:
         await self._state_machine.expire(cursor, message_id, now, old_status, attempt)
 
-    def _maintenance_event(self, row: aiosqlite.Row, name: str, status: str, *,
-                           reason: str | None = None, error_type: str | None = None,
-                           metric_name: str | None = None) -> _MaintenanceEvent:
-        return self._maintenance.event(row, name, status, reason=reason, error_type=error_type, metric_name=metric_name)
+    def _maintenance_event(
+        self,
+        row: aiosqlite.Row,
+        name: str,
+        status: str,
+        *,
+        reason: str | None = None,
+        error_type: str | None = None,
+        metric_name: str | None = None,
+    ) -> _MaintenanceEvent:
+        return self._maintenance.event(
+            row,
+            name,
+            status,
+            reason=reason,
+            error_type=error_type,
+            metric_name=metric_name,
+        )
 
     async def _emit_maintenance_events(self, events: list[_MaintenanceEvent]) -> None:
         await self._maintenance.emit(events)
 
-    async def _maintain(self, cursor: aiosqlite.Cursor, now: datetime,
-                        queue: str | None = None) -> tuple[int, list[_MaintenanceEvent]]:
+    async def _maintain(
+        self, cursor: aiosqlite.Cursor, now: datetime, queue: str | None = None
+    ) -> tuple[int, list[_MaintenanceEvent]]:
         return await self._maintenance.maintain(cursor, now, queue)
 
     async def maintain(self, queue: str | None = None) -> int:
@@ -449,13 +729,89 @@ class SQLiteBroker:
 
         return await self._maintenance.run(queue)
 
-    async def _finish(self, delivery: SQLiteDelivery, action: str, reason: str | None = None,
-                      error: BaseException | None = None, delay: timedelta | None = None,
-                      max_attempts: int | None = None) -> FinishOutcome:
-        return await self._state_machine.finish(delivery, action, reason, error, delay, max_attempts)
+    async def _finish(
+        self,
+        delivery: SQLiteDelivery,
+        action: str,
+        reason: str | None = None,
+        error: BaseException | None = None,
+        delay: timedelta | None = None,
+        max_attempts: int | None = None,
+    ) -> FinishOutcome:
+        return await self._state_machine.finish(
+            delivery, action, reason, error, delay, max_attempts
+        )
 
-    async def _extend(self, delivery: SQLiteDelivery, seconds: float | None) -> datetime:
+    async def _extend(
+        self, delivery: SQLiteDelivery, seconds: float | None
+    ) -> datetime:
         return await self._state_machine.extend(delivery, seconds)
+
+    async def _queue_stats(
+        self, connection: aiosqlite.Connection, queue: str
+    ) -> QueueStats:
+        cursor = await connection.cursor()
+
+        async def count(status: MessageStatus) -> int:
+            row = await (
+                await cursor.execute(
+                    "SELECT COUNT(*) FROM messages WHERE queue=? AND status=?",
+                    (queue, status.value),
+                )
+            ).fetchone()
+            assert row is not None
+            return row[0]
+
+        earliest_row = await (
+            await cursor.execute(
+                "SELECT MIN(created_at) FROM messages WHERE queue=? AND status=?",
+                (queue, MessageStatus.READY.value),
+            )
+        ).fetchone()
+        assert earliest_row is not None
+        counters = await (
+            await cursor.execute("SELECT * FROM queue_counters WHERE queue=?", (queue,))
+        ).fetchone()
+        values = counters or {
+            name: 0
+            for name in (
+                "submitted_total",
+                "acked_total",
+                "retried_total",
+                "reclaimed_total",
+                "dead_lettered_total",
+            )
+        }
+        dead_row = await (
+            await cursor.execute(
+                "SELECT COUNT(*) FROM dead_letters WHERE queue=?", (queue,)
+            )
+        ).fetchone()
+        expired_row = await (
+            await cursor.execute(
+                "SELECT COUNT(*) FROM expired_messages WHERE queue=?", (queue,)
+            )
+        ).fetchone()
+        assert dead_row is not None and expired_row is not None
+        ready, leased, delayed = (
+            await count(MessageStatus.READY),
+            await count(MessageStatus.LEASED),
+            await count(MessageStatus.DELAYED),
+        )
+        return QueueStats(
+            queue,
+            ready,
+            leased,
+            dead_row[0],
+            expired_row[0],
+            _datetime(earliest_row[0]),
+            values["submitted_total"],
+            values["acked_total"],
+            values["retried_total"],
+            values["reclaimed_total"],
+            values["dead_lettered_total"],
+            delayed,
+        )
 
     async def inspect(self, queue: str) -> QueueStats:
         """返回在一次锁定快照中读取到的队列统计。"""
@@ -465,78 +821,304 @@ class SQLiteBroker:
         await self.maintain(queue)
         async with self._lock:
             assert self._connection is not None
-            cursor = await self._connection.cursor()
-            async def count(status: MessageStatus) -> int:
-                row = await (await cursor.execute("SELECT COUNT(*) FROM messages WHERE queue=? AND status=?", (queue, status.value))).fetchone()
-                assert row is not None
-                return row[0]
-            earliest_row = await (await cursor.execute("SELECT MIN(created_at) FROM messages WHERE queue=? AND status=?", (queue, MessageStatus.READY.value))).fetchone()
-            assert earliest_row is not None
-            earliest = earliest_row[0]
-            counters = await (await cursor.execute("SELECT * FROM queue_counters WHERE queue=?", (queue,))).fetchone()
-            values = counters or {name: 0 for name in ("submitted_total", "acked_total", "retried_total", "reclaimed_total", "dead_lettered_total")}
-            dead_row = await (await cursor.execute("SELECT COUNT(*) FROM dead_letters WHERE queue=?", (queue,))).fetchone()
-            expired_row = await (await cursor.execute("SELECT COUNT(*) FROM expired_messages WHERE queue=?", (queue,))).fetchone()
-            assert dead_row is not None and expired_row is not None
-            ready, leased, delayed = await count(MessageStatus.READY), await count(MessageStatus.LEASED), await count(MessageStatus.DELAYED)
-            await metric(self.metrics, "queue_ready", float(ready), queue=queue)
-            await metric(self.metrics, "queue_leased", float(leased), queue=queue)
-            await metric(self.metrics, "queue_delayed", float(delayed), queue=queue)
-            return QueueStats(queue, ready, leased, dead_row[0], expired_row[0],
-                              _datetime(earliest), values["submitted_total"], values["acked_total"], values["retried_total"],
-                              values["reclaimed_total"], values["dead_lettered_total"], delayed)
+            stats = await self._queue_stats(self._connection, queue)
+        await metric(self.metrics, "queue_ready", float(stats.ready), queue=queue)
+        await metric(self.metrics, "queue_leased", float(stats.leased), queue=queue)
+        await metric(self.metrics, "queue_delayed", float(stats.delayed), queue=queue)
+        return stats
 
     async def inspect_message(self, message_id: str) -> TaskMessage | None:
         """按稳定 message ID 查询原始业务消息，不改变其状态。"""
         await self.start()
         async with self._lock:
             assert self._connection is not None
-            row = await (await self._connection.execute(
-                "SELECT envelope, serializer_name, serializer_version FROM messages WHERE id=?", (message_id,))).fetchone()
-        return None if row is None else self._decode_message(row["envelope"], row["serializer_name"], row["serializer_version"])
+            row = await (
+                await self._connection.execute(
+                    "SELECT envelope, serializer_name, serializer_version FROM messages WHERE id=?",
+                    (message_id,),
+                )
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._decode_message(
+                row["envelope"], row["serializer_name"], row["serializer_version"]
+            )
+        )
+
+    async def observe_queue(self, queue: str) -> QueueStats:
+        """Read a queue snapshot without maintenance, migrations, or metrics emission."""
+
+        self._validate_queue(queue)
+        async with self._read_connection() as connection:
+            return await self._queue_stats(connection, queue)
+
+    async def observe_message(self, message_id: str) -> TaskMessage | None:
+        """Read one message without opening or migrating a SQLite database."""
+
+        async with self._read_connection() as connection:
+            row = await (
+                await connection.execute(
+                    "SELECT envelope, serializer_name, serializer_version FROM messages WHERE id=?",
+                    (message_id,),
+                )
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else self._decode_message(
+                row["envelope"], row["serializer_name"], row["serializer_version"]
+            )
+        )
+
+    async def list_queues(
+        self, *, cursor: str | None = None, limit: int = 100
+    ) -> Page[QueueStats]:
+        """List persisted queues with a stable lexicographic cursor."""
+
+        limit = validate_page_limit(limit)
+        cursor_values = decode_cursor(cursor, size=1)
+        after_queue = "" if cursor_values is None else cursor_values[0]
+        if not isinstance(after_queue, str):
+            raise ValidationError("cursor 不属于队列列表")
+        async with self._read_connection() as connection:
+            rows = list(
+                await (
+                    await connection.execute(
+                        "SELECT DISTINCT queue FROM messages WHERE queue > ? "
+                        "ORDER BY queue LIMIT ?",
+                        (after_queue, limit + 1),
+                    )
+                ).fetchall()
+            )
+            total_row = await (
+                await connection.execute("SELECT COUNT(DISTINCT queue) FROM messages")
+            ).fetchone()
+            assert total_row is not None
+            queue_names = [row["queue"] for row in rows[:limit]]
+            items_list: list[QueueStats] = []
+            for queue_name in queue_names:
+                items_list.append(await self._queue_stats(connection, queue_name))
+        next_cursor = encode_cursor(queue_names[-1]) if len(rows) > limit else None
+        return Page(tuple(items_list), next_cursor, int(total_row[0]))
+
+    async def list_message_summaries(
+        self,
+        queue: str,
+        *,
+        status: MessageStatus | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> Page[MessageSummary]:
+        """List message metadata without reading serialized payloads."""
+
+        self._validate_queue(queue)
+        limit = validate_page_limit(limit)
+        if status is not None and not isinstance(status, MessageStatus):
+            raise ValidationError("status 必须是 MessageStatus")
+        cursor_values = decode_cursor(cursor, size=2)
+        where = ["queue=?"]
+        parameters: list[Any] = [queue]
+        if status is not None:
+            where.append("status=?")
+            parameters.append(status.value)
+        if cursor_values is not None:
+            created_at, message_id = cursor_values
+            if (
+                isinstance(created_at, bool)
+                or not isinstance(created_at, (int, float))
+                or not isinstance(message_id, str)
+            ):
+                raise ValidationError("cursor 不属于消息列表")
+            where.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            parameters.extend((created_at, created_at, message_id))
+        where_sql = " AND ".join(where)
+        columns = (
+            "id, queue, status, attempt, created_at, serializer_name, serializer_version, "
+            "last_action, last_reason, consumer_id, delivery_id, claimed_at, lease_until"
+        )
+        async with self._read_connection() as connection:
+            rows = list(
+                await (
+                    await connection.execute(
+                        f"SELECT {columns} FROM messages WHERE {where_sql} "
+                        "ORDER BY created_at DESC, id DESC LIMIT ?",
+                        (*parameters, limit + 1),
+                    )
+                ).fetchall()
+            )
+            total_row = await (
+                await connection.execute(
+                    f"SELECT COUNT(*) FROM messages WHERE {where_sql}", parameters
+                )
+            ).fetchone()
+            assert total_row is not None
+        items = tuple(self._message_summary(row) for row in rows[:limit])
+        next_cursor = (
+            encode_cursor(rows[limit - 1]["created_at"], rows[limit - 1]["id"])
+            if len(rows) > limit
+            else None
+        )
+        return Page(items, next_cursor, int(total_row[0]))
+
+    @staticmethod
+    def _message_summary(row: aiosqlite.Row) -> MessageSummary:
+        return MessageSummary(
+            message_id=row["id"],
+            queue=row["queue"],
+            status=MessageStatus(row["status"]),
+            attempt=int(row["attempt"]),
+            created_at=_datetime(row["created_at"]) or utc_now(),
+            serializer_name=row["serializer_name"],
+            serializer_version=row["serializer_version"],
+            last_action=row["last_action"],
+            last_reason=row["last_reason"],
+            consumer_id=row["consumer_id"],
+            delivery_id=row["delivery_id"],
+            claimed_at=_datetime(row["claimed_at"])
+            if row["claimed_at"] is not None
+            else None,
+            lease_until=_datetime(row["lease_until"])
+            if row["lease_until"] is not None
+            else None,
+        )
+
+    async def list_messages(
+        self,
+        queue: str,
+        *,
+        status: MessageStatus | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> Page[MessageState]:
+        """List queue messages newest first without changing broker state."""
+
+        self._validate_queue(queue)
+        limit = validate_page_limit(limit)
+        if status is not None and not isinstance(status, MessageStatus):
+            raise ValidationError("status 必须是 MessageStatus")
+        cursor_values = decode_cursor(cursor, size=2)
+        where = ["queue=?"]
+        parameters: list[Any] = [queue]
+        if status is not None:
+            where.append("status=?")
+            parameters.append(status.value)
+        if cursor_values is not None:
+            created_at, message_id = cursor_values
+            if (
+                isinstance(created_at, bool)
+                or not isinstance(created_at, (int, float))
+                or not isinstance(message_id, str)
+            ):
+                raise ValidationError("cursor 不属于消息列表")
+            where.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            parameters.extend((created_at, created_at, message_id))
+        where_sql = " AND ".join(where)
+        columns = (
+            "id, envelope, serializer_name, serializer_version, status, attempt, "
+            "last_action, last_reason, consumer_id, delivery_id, claimed_at, lease_until, created_at"
+        )
+        async with self._read_connection() as connection:
+            rows = list(
+                await (
+                    await connection.execute(
+                        f"SELECT {columns} FROM messages WHERE {where_sql} "
+                        "ORDER BY created_at DESC, id DESC LIMIT ?",
+                        (*parameters, limit + 1),
+                    )
+                ).fetchall()
+            )
+            total_row = await (
+                await connection.execute(
+                    f"SELECT COUNT(*) FROM messages WHERE {where_sql}", parameters
+                )
+            ).fetchone()
+            assert total_row is not None
+        items = tuple(self._message_state(row) for row in rows[:limit])
+        next_cursor = (
+            encode_cursor(rows[limit - 1]["created_at"], rows[limit - 1]["id"])
+            if len(rows) > limit
+            else None
+        )
+        return Page(items, next_cursor, int(total_row[0]))
+
+    def _message_state(self, row: aiosqlite.Row) -> MessageState:
+        return MessageState(
+            message=self._decode_message(
+                row["envelope"], row["serializer_name"], row["serializer_version"]
+            ),
+            status=MessageStatus(row["status"]),
+            attempt=int(row["attempt"]),
+            last_action=row["last_action"],
+            last_reason=row["last_reason"],
+            consumer_id=row["consumer_id"],
+            delivery_id=row["delivery_id"],
+            claimed_at=_datetime(row["claimed_at"])
+            if row["claimed_at"] is not None
+            else None,
+            lease_until=_datetime(row["lease_until"])
+            if row["lease_until"] is not None
+            else None,
+        )
 
     async def health_check(self) -> HealthReport:
-        """Run non-mutating checks for the SQLite connection and persisted data.
-
-        Unlike the v0.4 CLI probe this verifies the schema metadata, required
-        indexes and every serializer identity currently referenced by messages.
-        """
+        """Run non-mutating checks for the SQLite connection and persisted data."""
 
         if self._closed:
-            return HealthReport(False, "sqlite", None, (
-                HealthCheck("connection", "error", "broker is closed"),
-            ))
+            return HealthReport(
+                False,
+                "sqlite",
+                None,
+                (HealthCheck("connection", "error", "broker is closed"),),
+            )
         try:
-            await self.start()
-            async with self._lock:
-                assert self._connection is not None
-                await (await self._connection.execute("SELECT 1")).fetchone()
-                version_row = await (await self._connection.execute(
-                    "SELECT value FROM taskflow_schema WHERE key='version'"
-                )).fetchone()
-                index_rows = await (await self._connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'"
-                )).fetchall()
-                serializer_rows = await (await self._connection.execute(
-                    "SELECT DISTINCT serializer_name, serializer_version FROM messages"
-                )).fetchall()
+            async with self._read_connection() as connection:
+                await (await connection.execute("SELECT 1")).fetchone()
+                version_row = await (
+                    await connection.execute(
+                        "SELECT value FROM taskflow_schema WHERE key='version'"
+                    )
+                ).fetchone()
+                index_rows = await (
+                    await connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'"
+                    )
+                ).fetchall()
+                serializer_rows = await (
+                    await connection.execute(
+                        "SELECT DISTINCT serializer_name, serializer_version FROM messages"
+                    )
+                ).fetchall()
         except Exception as exc:  # noqa: BLE001 - report driver failures as diagnostics
-            return HealthReport(False, "sqlite", None, (
-                HealthCheck("connection", "error", f"{type(exc).__name__}: {exc}"),
-            ))
+            return HealthReport(
+                False,
+                "sqlite",
+                None,
+                (HealthCheck("connection", "error", f"{type(exc).__name__}: {exc}"),),
+            )
 
         checks: list[HealthCheck] = [HealthCheck("connection", "ok")]
         version = version_row["value"] if version_row is not None else None
-        checks.append(HealthCheck(
-            "schema_version", "ok" if version == _SQLITE_SCHEMA_VERSION else "error",
-            None if version == _SQLITE_SCHEMA_VERSION else f"expected {_SQLITE_SCHEMA_VERSION}, found {version!r}",
-        ))
+        checks.append(
+            HealthCheck(
+                "schema_version",
+                "ok" if version == _SQLITE_SCHEMA_VERSION else "error",
+                None
+                if version == _SQLITE_SCHEMA_VERSION
+                else f"expected {_SQLITE_SCHEMA_VERSION}, found {version!r}",
+            )
+        )
         indexes = {row["name"] for row in index_rows}
         missing_indexes = sorted(_REQUIRED_SQLITE_INDEXES - indexes)
-        checks.append(HealthCheck(
-            "required_indexes", "ok" if not missing_indexes else "error",
-            None if not missing_indexes else f"missing: {', '.join(missing_indexes)}",
-        ))
+        checks.append(
+            HealthCheck(
+                "required_indexes",
+                "ok" if not missing_indexes else "error",
+                None
+                if not missing_indexes
+                else f"missing: {', '.join(missing_indexes)}",
+            )
+        )
         unavailable: list[str] = []
         for row in serializer_rows:
             name, version = row["serializer_name"], row["serializer_version"]
@@ -544,17 +1126,28 @@ class SQLiteBroker:
                 self.serializer_registry.resolve(name, version)
             except SerializerUnavailableError:
                 unavailable.append(f"{name}@{version}")
-        checks.append(HealthCheck(
-            "serializer_registry", "ok" if not unavailable else "error",
-            None if not unavailable else f"unavailable: {', '.join(sorted(unavailable))}",
-        ))
+        checks.append(
+            HealthCheck(
+                "serializer_registry",
+                "ok" if not unavailable else "error",
+                None
+                if not unavailable
+                else f"unavailable: {', '.join(sorted(unavailable))}",
+            )
+        )
         checks.append(HealthCheck("namespace", "ok", "SQLite has no namespace"))
-        checks.append(HealthCheck(
-            "unrecoverable_errors", "ok" if not unavailable else "error",
-            None if not unavailable else "messages require unavailable serializers",
-        ))
+        checks.append(
+            HealthCheck(
+                "unrecoverable_errors",
+                "ok" if not unavailable else "error",
+                None if not unavailable else "messages require unavailable serializers",
+            )
+        )
         return HealthReport(
-            all(check.status != "error" for check in checks), "sqlite", None, tuple(checks),
+            all(check.status != "error" for check in checks),
+            "sqlite",
+            None,
+            tuple(checks),
         )
 
     async def check_consistency(self, queue: str) -> ConsistencyReport:
@@ -566,27 +1159,52 @@ class SQLiteBroker:
             assert self._connection is not None
             issues: list[ConsistencyIssue] = []
             queries = (
-                ("missing_dead_letter", "SELECT id FROM messages m WHERE queue=? AND status='dead_lettered' AND NOT EXISTS (SELECT 1 FROM dead_letters d WHERE d.message_id=m.id)"),
-                ("orphan_dead_letter", "SELECT d.message_id FROM dead_letters d LEFT JOIN messages m ON m.id=d.message_id WHERE d.queue=? AND (m.id IS NULL OR m.status!='dead_lettered')"),
-                ("missing_expired", "SELECT id FROM messages m WHERE queue=? AND status='expired' AND NOT EXISTS (SELECT 1 FROM expired_messages e WHERE e.message_id=m.id)"),
-                ("orphan_expired", "SELECT e.message_id FROM expired_messages e LEFT JOIN messages m ON m.id=e.message_id WHERE e.queue=? AND (m.id IS NULL OR m.status!='expired')"),
-                ("leased_without_lease", "SELECT id FROM messages WHERE queue=? AND status='leased' AND (lease_until IS NULL OR delivery_id IS NULL OR lease_token IS NULL)"),
+                (
+                    "missing_dead_letter",
+                    "SELECT id FROM messages m WHERE queue=? AND status='dead_lettered' AND NOT EXISTS (SELECT 1 FROM dead_letters d WHERE d.message_id=m.id)",
+                ),
+                (
+                    "orphan_dead_letter",
+                    "SELECT d.message_id FROM dead_letters d LEFT JOIN messages m ON m.id=d.message_id WHERE d.queue=? AND (m.id IS NULL OR m.status!='dead_lettered')",
+                ),
+                (
+                    "missing_expired",
+                    "SELECT id FROM messages m WHERE queue=? AND status='expired' AND NOT EXISTS (SELECT 1 FROM expired_messages e WHERE e.message_id=m.id)",
+                ),
+                (
+                    "orphan_expired",
+                    "SELECT e.message_id FROM expired_messages e LEFT JOIN messages m ON m.id=e.message_id WHERE e.queue=? AND (m.id IS NULL OR m.status!='expired')",
+                ),
+                (
+                    "leased_without_lease",
+                    "SELECT id FROM messages WHERE queue=? AND status='leased' AND (lease_until IS NULL OR delivery_id IS NULL OR lease_token IS NULL)",
+                ),
             )
             for name, query in queries:
-                rows = await (await self._connection.execute(query, (queue,))).fetchall()
+                rows = await (
+                    await self._connection.execute(query, (queue,))
+                ).fetchall()
                 issues.extend(ConsistencyIssue(name, row[0]) for row in rows)
-            index_rows = await (await self._connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'"
-            )).fetchall()
-            for name in sorted(_REQUIRED_SQLITE_INDEXES - {row[0] for row in index_rows}):
+            index_rows = await (
+                await self._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='messages'"
+                )
+            ).fetchall()
+            for name in sorted(
+                _REQUIRED_SQLITE_INDEXES - {row[0] for row in index_rows}
+            ):
                 issues.append(ConsistencyIssue("missing_index", detail=name))
         return ConsistencyReport(queue, "sqlite", None, tuple(issues))
 
-    async def repair_consistency(self, queue: str, *, dry_run: bool = True) -> RepairReport:
+    async def repair_consistency(
+        self, queue: str, *, dry_run: bool = True
+    ) -> RepairReport:
         """Propose repairs by default; apply only audit/index repairs when explicit."""
 
         report = await self.check_consistency(queue)
-        repairable = tuple(issue for issue in report.issues if issue.name != "leased_without_lease")
+        repairable = tuple(
+            issue for issue in report.issues if issue.name != "leased_without_lease"
+        )
         if dry_run or not repairable:
             return RepairReport(queue, "sqlite", None, dry_run, repairable)
         await self.start()
@@ -598,17 +1216,54 @@ class SQLiteBroker:
             try:
                 for issue in repairable:
                     if issue.name == "missing_dead_letter":
-                        row = await (await cursor.execute("SELECT attempt FROM messages WHERE id=?", (issue.message_id,))).fetchone()
+                        row = await (
+                            await cursor.execute(
+                                "SELECT attempt FROM messages WHERE id=?",
+                                (issue.message_id,),
+                            )
+                        ).fetchone()
                         if row is not None:
-                            await cursor.execute("INSERT OR IGNORE INTO dead_letters VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (issue.message_id, queue, row[0], "consistency_repair", "repair", now, None, None))
+                            await cursor.execute(
+                                "INSERT OR IGNORE INTO dead_letters VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                (
+                                    issue.message_id,
+                                    queue,
+                                    row[0],
+                                    "consistency_repair",
+                                    "repair",
+                                    now,
+                                    None,
+                                    None,
+                                ),
+                            )
                     elif issue.name == "missing_expired":
-                        row = await (await cursor.execute("SELECT attempt FROM messages WHERE id=?", (issue.message_id,))).fetchone()
+                        row = await (
+                            await cursor.execute(
+                                "SELECT attempt FROM messages WHERE id=?",
+                                (issue.message_id,),
+                            )
+                        ).fetchone()
                         if row is not None:
-                            await cursor.execute("INSERT OR IGNORE INTO expired_messages VALUES (?, ?, ?, ?, ?)", (issue.message_id, queue, row[0], MessageStatus.EXPIRED.value, now))
+                            await cursor.execute(
+                                "INSERT OR IGNORE INTO expired_messages VALUES (?, ?, ?, ?, ?)",
+                                (
+                                    issue.message_id,
+                                    queue,
+                                    row[0],
+                                    MessageStatus.EXPIRED.value,
+                                    now,
+                                ),
+                            )
                     elif issue.name == "orphan_dead_letter":
-                        await cursor.execute("DELETE FROM dead_letters WHERE queue=? AND message_id=?", (queue, issue.message_id))
+                        await cursor.execute(
+                            "DELETE FROM dead_letters WHERE queue=? AND message_id=?",
+                            (queue, issue.message_id),
+                        )
                     elif issue.name == "orphan_expired":
-                        await cursor.execute("DELETE FROM expired_messages WHERE queue=? AND message_id=?", (queue, issue.message_id))
+                        await cursor.execute(
+                            "DELETE FROM expired_messages WHERE queue=? AND message_id=?",
+                            (queue, issue.message_id),
+                        )
                     elif issue.name == "missing_index" and issue.detail:
                         definitions = {
                             "idx_messages_claim": "CREATE INDEX IF NOT EXISTS idx_messages_claim ON messages(queue, status, created_at)",

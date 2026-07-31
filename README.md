@@ -28,12 +28,15 @@ async def main() -> None:
             dedup_key="example.com:/",
             dedup_ttl=timedelta(days=7),
         )
+
         async def fetch(message):
             # 在这里完成可重试且幂等的业务副作用。
             print(message.payload["url"])
 
         async with broker.worker(
-            "crawl.fetch", fetch, concurrency=10,
+            "crawl.fetch",
+            fetch,
+            concurrency=10,
             retry_policy=RetryPolicy(
                 max_attempts=5,
                 backoff=ExponentialBackoff(initial=1, maximum=60, jitter=True),
@@ -51,11 +54,13 @@ Worker API 与 SQLite 完全相同，适合多进程或多实例消费者：
 ```python
 from taskflow import RedisBroker
 
+
 async def main() -> None:
     broker = RedisBroker.from_url("redis://127.0.0.1:6379/2")
     async with broker:
         async with broker.worker("emails", handle_email, concurrency=20) as worker:
             await worker.run()
+
 
 asyncio.run(main())
 ```
@@ -93,6 +98,7 @@ class ResizePayload(TypedDict):
     image_id: str
     width: int
     height: int
+
 
 await broker.submit(
     queue="image.resize",
@@ -136,6 +142,20 @@ CLI 对应 `taskflow queue check-consistency QUEUE` 和 `taskflow queue repair-c
 兼容；废弃 API 会先在文档和 CHANGELOG 中声明。安全问题请参阅 [SECURITY.md](SECURITY.md)，
 贡献规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+## v0.6 开发计划：交互式运维 CLI
+
+> v0.6 正在开发中，尚未发布。当前 TUI 已提供 health、按需加载的队列与消息/DLQ/EQ 浏览、分页搜索和受保护的管理操作；其余验收项仍按清单推进。
+
+安装可选依赖后，可从 TTY 启动交互界面：
+
+```bash
+pip install "taskflow[tui]"
+taskflow tui --sqlite taskflow.db
+taskflow shell --sqlite taskflow.db
+```
+
+TUI 使用成熟的 [Textual](https://textual.textualize.io/) 实现：health 自动刷新，队列与记录按需读取；shell 使用 `prompt_toolkit`。TUI 支持队列/消息/DLQ/EQ 浏览、显式显示 payload、队列级或单条 replay/delete，以及先执行 dry-run 再确认的 consistency repair。所有写操作仅经公开 Admin API，并在影响摘要弹框中按 `y` 确认、按 `n` 或 `Esc` 取消；payload 默认隐藏。基础安装不导入这些依赖；非 TTY 会给出使用既有 JSON CLI 的提示。完整设计、交付门槛和兼容性目标分别见 [v0.6 TUI CLI 设计](docs/v0.6-tui-cli.md)、[v0.6 验收清单](docs/v0.6-acceptance.md) 与 [v0.5→v0.6 升级说明](docs/migration-v0.5-v0.6.md)。
+
 ## v0.3 配置与扩展点
 
 `QueueConfig` 可为每个 queue 设置最大尝试次数、lease、重试策略、默认 dedup TTL
@@ -170,3 +190,11 @@ uv build
 
 常见场景的可独立运行示例见 [`examples/`](examples/README.md)：SQLite/Redis Worker、重试与延迟、
 批量与 dedup、类型化 payload、显式 Delivery、DLQ 重放，以及 v0.5 health/consistency 诊断。
+
+## 交互式运维
+
+安装 `taskflow[tui]` 后可在 TTY 中运行 `taskflow tui --sqlite taskflow.db` 或
+`taskflow shell --sqlite taskflow.db`。两者使用分页的公开 Broker/Admin API；默认脱敏
+payload。TUI 的 replay、删除和一致性修复均展示影响摘要，并要求按 `y` 确认或按 `n`/`Esc`
+取消。基础安装不导入交互依赖，非 TTY 请继续使用 JSON CLI。操作细节见
+[`docs/operations.md`](docs/operations.md)。

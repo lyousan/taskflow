@@ -1,4 +1,5 @@
 """面向扩展者的异步公共协议。"""
+
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
@@ -13,6 +14,10 @@ from .types import (
     BatchSubmitItemResult,
     ConsumerOptions,
     FinishOutcome,
+    MessageState,
+    MessageStatus,
+    MessageSummary,
+    Page,
     QueueStats,
     SubmitRequest,
     SubmitResult,
@@ -35,9 +40,16 @@ class TaskDelivery(Protocol):
     lease_until: datetime
 
     async def ack(self) -> FinishOutcome: ...
-    async def retry(self, *, reason: str | None = None, delay: timedelta | None = None,
-                    max_attempts: int | None = None) -> FinishOutcome: ...
-    async def reject(self, *, reason: str, error: BaseException | None = None) -> FinishOutcome: ...
+    async def retry(
+        self,
+        *,
+        reason: str | None = None,
+        delay: timedelta | None = None,
+        max_attempts: int | None = None,
+    ) -> FinishOutcome: ...
+    async def reject(
+        self, *, reason: str, error: BaseException | None = None
+    ) -> FinishOutcome: ...
     async def extend_lease(self, *, seconds: float | None = None) -> datetime: ...
 
 
@@ -58,35 +70,91 @@ class TaskBroker(Protocol):
     async def start(self) -> None: ...
     async def close(self) -> None: ...
     async def submit(
-        self, *, queue: str, payload: Any, metadata: Mapping[str, Any] | None = None,
-        dedup_key: str | None = None, dedup_scope: str | None = None,
-        dedup_ttl: timedelta | None = None, delay: timedelta | None = None, expires_at: datetime | None = None,
-        max_attempts: int | None = None, workflow_id: str | None = None,
-        parent_id: str | None = None, payload_type: type[Any] | None = None,
+        self,
+        *,
+        queue: str,
+        payload: Any,
+        metadata: Mapping[str, Any] | None = None,
+        dedup_key: str | None = None,
+        dedup_scope: str | None = None,
+        dedup_ttl: timedelta | None = None,
+        delay: timedelta | None = None,
+        expires_at: datetime | None = None,
+        max_attempts: int | None = None,
+        workflow_id: str | None = None,
+        parent_id: str | None = None,
+        payload_type: type[Any] | None = None,
     ) -> SubmitResult: ...
     @overload
-    async def submit_many(self, messages: list[SubmitRequest], *, atomic: Literal[True] = True) -> list[SubmitResult]: ...
+    async def submit_many(
+        self, messages: list[SubmitRequest], *, atomic: Literal[True] = True
+    ) -> list[SubmitResult]: ...
     @overload
-    async def submit_many(self, messages: list[SubmitRequest], *, atomic: Literal[False]) -> list[BatchSubmitItemResult]: ...
-    async def submit_many(self, messages: list[SubmitRequest], *, atomic: bool = True) -> list[SubmitResult] | list[BatchSubmitItemResult]: ...
-    def consumer(self, queue: str, *, consumer_id: str | None = None, options: ConsumerOptions | None = None) -> TaskConsumer: ...
+    async def submit_many(
+        self, messages: list[SubmitRequest], *, atomic: Literal[False]
+    ) -> list[BatchSubmitItemResult]: ...
+    async def submit_many(
+        self, messages: list[SubmitRequest], *, atomic: bool = True
+    ) -> list[SubmitResult] | list[BatchSubmitItemResult]: ...
+    def consumer(
+        self,
+        queue: str,
+        *,
+        consumer_id: str | None = None,
+        options: ConsumerOptions | None = None,
+    ) -> TaskConsumer: ...
     def worker(
-        self, queue: str, handler: Handler, *, concurrency: int | None = None,
-        consumer_id: str | None = None, options: ConsumerOptions | None = None,
-        retry_policy: RetryPolicy | None = None, heartbeat_seconds: float | None = None,
+        self,
+        queue: str,
+        handler: Handler,
+        *,
+        concurrency: int | None = None,
+        consumer_id: str | None = None,
+        options: ConsumerOptions | None = None,
+        retry_policy: RetryPolicy | None = None,
+        heartbeat_seconds: float | None = None,
         payload_type: type[Any] | None = None,
     ) -> TaskWorker: ...
     async def run(
-        self, queue: str, handler: Handler, *, concurrency: int | None = None,
-        consumer_id: str | None = None, options: ConsumerOptions | None = None,
-        retry_policy: RetryPolicy | None = None, heartbeat_seconds: float | None = None,
+        self,
+        queue: str,
+        handler: Handler,
+        *,
+        concurrency: int | None = None,
+        consumer_id: str | None = None,
+        options: ConsumerOptions | None = None,
+        retry_policy: RetryPolicy | None = None,
+        heartbeat_seconds: float | None = None,
         payload_type: type[Any] | None = None,
     ) -> None: ...
     async def inspect(self, queue: str) -> QueueStats: ...
     async def inspect_message(self, message_id: str) -> TaskMessage | None: ...
+    async def observe_queue(self, queue: str) -> QueueStats: ...
+    async def observe_message(self, message_id: str) -> TaskMessage | None: ...
+    async def list_queues(
+        self, *, cursor: str | None = None, limit: int = 100
+    ) -> Page[QueueStats]: ...
+    async def list_messages(
+        self,
+        queue: str,
+        *,
+        status: MessageStatus | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> Page[MessageState]: ...
+    async def list_message_summaries(
+        self,
+        queue: str,
+        *,
+        status: MessageStatus | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+    ) -> Page[MessageSummary]: ...
     async def health_check(self) -> HealthReport: ...
     async def check_consistency(self, queue: str) -> ConsistencyReport: ...
-    async def repair_consistency(self, queue: str, *, dry_run: bool = True) -> RepairReport: ...
+    async def repair_consistency(
+        self, queue: str, *, dry_run: bool = True
+    ) -> RepairReport: ...
 
 
 class SubmissionStore(Protocol):
@@ -98,6 +166,8 @@ class SubmissionStore(Protocol):
         """在 backend 的原子边界内完成单条准入和入队。"""
         ...
 
-    async def submit_many(self, submissions: list[PreparedSubmission]) -> list[SubmitResult]:
+    async def submit_many(
+        self, submissions: list[PreparedSubmission]
+    ) -> list[SubmitResult]:
         """在实现声明的批量语义下完成一组准入和入队。"""
         ...

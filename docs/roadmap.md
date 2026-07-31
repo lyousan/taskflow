@@ -43,6 +43,7 @@ Taskflow **不承诺 exactly-once 业务处理**。所有版本都必须保留�
 | v0.3 | 配置、扩展点与可观测性 | 按 queue 配置策略，提供稳定的 metrics/events 和 serializer 边界 |
 | v0.4 | 性能、管理能力与类型化 | 批量提交、类型化任务、管理 API/CLI、replay 策略完整 |
 | v0.5 | 生产化与兼容性 | 压测、故障演练、迁移、健康检查、发布质量和稳定 API |
+| v0.6 | 交互式运维控制台 | Textual TUI、交互式 shell、队列/消息浏览与受保护管理操作 |
 
 版本不是简单的时间节点。每个版本只有在“功能、测试、文档、兼容性和验收”全部完成后才允许发布。
 
@@ -661,7 +662,72 @@ v0.5 发布前必须具备：
 
 ---
 
-# 7. 推荐代码组织
+# 7. v0.6：交互式运维控制台
+
+v0.6 在不改变消息投递语义或后端状态机的前提下，把 v0.4/v0.5 已有的 Admin、health 和 consistency 能力提供为可交互的终端体验。完整交互、命令、数据边界及验收定义见 [`v0.6 TUI CLI 设计`](v0.6-tui-cli.md) 和 [`v0.6 验收清单`](v0.6-acceptance.md)。
+
+## 7.1 版本目标
+
+- 提供可选安装的全屏 TUI 和适合 SSH/脚本调试的 REPL；现有非交互式 `taskflow` 命令必须保持兼容。
+- 让运维人员无需直接读取 Redis key 或 SQLite 表，即可完成健康诊断、队列观察、消息/DLQ 排障和一致性修复审阅。
+- 所有写操作继续只经由公开 Broker/Admin API；TUI/REPL 绝不实现或绕过 backend-specific 状态迁移。
+- 将“消息已重新投递”和“业务 handler 已成功处理”明确区分，避免把 replay enqueue 误报为业务成功。
+
+## 7.2 功能范围
+
+### A. 可选依赖与入口
+
+新增 `taskflow[tui]` extra，以 Textual 实现全屏界面；REPL 可使用 `prompt_toolkit`。计划入口：
+
+```bash
+taskflow tui --sqlite taskflow.db
+taskflow shell --redis-url redis://host/2 --namespace payments
+```
+
+不安装 extra 时，现有非交互 CLI 正常可用，并对 `tui`/`shell` 给出明确的安装提示。TUI 不能要求启动 worker，不能修改 broker 的启动、Consumer Group 初始化或维护语义。
+
+### B. 只读看板与浏览
+
+TUI 首页至少展示 backend、脱敏连接信息、namespace、health 状态、最后刷新时间和错误/警告摘要；队列页展示 READY、DELAYED、LEASED、DLQ、EQ 及累计计数。支持手动刷新、可配置轮询、筛选、排序、详情页和 JSON 原始报告查看。
+
+消息详情显示状态、attempt、时间、consumer/delivery、失败原因、serializer/schema 与 dedup 元数据。payload 必须默认隐藏；展示 payload 需由用户显式触发，并在界面中显示敏感数据警告。
+
+为保证跨 backend 一致的浏览体验，补充并稳定公开的分页 API：`list_queues()`、`list_messages(queue, *, status, cursor, limit)`，以及 EQ 列表/详情 API。不得通过扫描私有 Redis key 或 SQLite 表来伪造公共功能；如某 backend 无法提供相同语义，必须由 capability 明示。
+
+### C. REPL、命令提示与可发现性
+
+REPL 提供上下文 prompt、命令历史、Tab 补全、`help`、错误建议和 JSON 输出。首期命令至少覆盖 `health`、queue inspect/use、message inspect、DLQ list/show/replay、consistency check/repair；命令名、queue 和可查询 message ID 应支持动态补全。
+
+TUI 提供 `?` 帮助、`r` 刷新、`/` 搜索、`:` 命令面板、`q` 返回/退出等一致快捷键；所有快捷键及非 TTY 降级行为写入 operations 文档。
+
+### D. 受保护的管理工作流
+
+DLQ replay、删除和 consistency repair 必须展示影响摘要、target queue、dedup mode 与风险提示。实际写入仍必须经过显式确认：TUI 需二次确认（输入操作词或资源名），REPL/非交互 CLI 继续要求 `--yes`，repair 继续要求 `--apply --yes`。
+
+replay 完成页只能报告 `replay_enqueued`（已从 DLQ/EQ 原子转移并重新投递）；不得显示“处理成功”。TUI 可轮询消息后续状态，并明确标注结果由异步 worker 决定。
+
+### E. 安全、性能与可访问性
+
+- 不在状态栏、历史记录、崩溃报告或默认复制操作中泄露 payload、Redis 密码、完整 dedup key；
+- 默认只读，所有危险操作有明确的不可逆提示和审计友好的结果摘要；
+- 列表必须分页，自动刷新不得对大队列执行无界全量扫描；
+- 支持窄终端、无色终端、非 TTY 失败提示和键盘全程操作；
+- TUI 进程退出时取消刷新任务并关闭 broker，不影响运行中的外部 worker。
+
+## 7.3 非目标
+
+- 不在 TUI 内编写、部署、启动或停止业务 handler/worker；
+- 不承诺实时监控、Web 控制台、多用户认证授权或远程命令执行；
+- 不把 TUI 轮询视为 scheduler/maintenance 替代品；
+- 不改变 at-least-once、ACK、lease、dedup 或 replay 的既有语义。
+
+## 7.4 兼容性与发布
+
+v0.6 保持 v0.5 的 Python API 与非交互 CLI 兼容。新增依赖必须为 optional extra；普通库用户不应因安装 TUI 而增加运行时依赖。发布前提供从 v0.5 升级的说明，明确 TUI 不引入 SQLite schema 或 Redis keyspace migration，且所有交互式写操作仍遵守 v0.5 安全确认边界；兼容性目标见 [`migration-v0.5-v0.6.md`](migration-v0.5-v0.6.md)。
+
+---
+
+# 8. 推荐代码组织
 
 为了避免所有能力继续堆积在 Broker 类中，建议逐步采用以下结构：
 
@@ -711,7 +777,7 @@ Worker 不应直接拼 Redis key，Admin 不应绕过 Store 修改提交状态�
 
 ---
 
-# 8. 每个版本的开发工作流
+# 9. 每个版本的开发工作流
 
 每个功能都必须按以下顺序落地：
 
@@ -734,7 +800,7 @@ Worker 不应直接拼 Redis key，Admin 不应绕过 Store 修改提交状态�
 
 ---
 
-# 9. 优先级建议
+# 10. 优先级建议
 
 如果开发资源有限，优先级应为：
 
@@ -767,7 +833,7 @@ Worker 不应直接拼 Redis key，Admin 不应绕过 Store 修改提交状态�
 
 ---
 
-# 10. 成熟度判断标准
+# 11. 成熟度判断标准
 
 Taskflow 可以被认为达到“适合一般生产项目使用”的阶段，需要满足：
 

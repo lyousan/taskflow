@@ -1,4 +1,5 @@
 """Backend 与提交策略的能力声明。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -28,6 +29,9 @@ class BackendCapabilities:
     partition_ordering: bool = False
     distributed_consumers: bool = False
     high_throughput: bool = False
+    paginated_observation: bool = False
+    stable_pagination_cursors: bool = False
+    message_status_filter: bool = False
 
 
 @dataclass(frozen=True, slots=True)

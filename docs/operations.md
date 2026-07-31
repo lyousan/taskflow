@@ -1,5 +1,15 @@
 # v0.4 Worker、配置、观测、类型化 payload 与管理
 
+## v0.6 交互式运维 CLI
+
+安装可选 extra 后，`taskflow tui --sqlite taskflow.db` 启动 Textual 控制台，`taskflow shell --sqlite taskflow.db` 启动 `prompt_toolkit` shell。两者均要求 TTY；基础安装不导入交互依赖，非 TTY、缺少 extra 时均给出可操作提示并以非零状态退出，自动化场景应继续使用既有 JSON CLI。
+
+TUI 提供 health、分页队列/消息/DLQ/EQ 浏览、过滤搜索、窄终端布局、键盘帮助与命令面板。`0` 聚焦当前主内容；`1`、`2`、`3` 分别聚焦状态、命名空间和队列；Redis 的命名空间列表由 schema marker 发现，选择后会切换当前 Broker 的观测和管理命名空间。`r` 刷新，`m`/`d`/`e` 切换消息、DLQ、EQ，`[`/`]` 翻页，`v` 显示选中消息 payload。焦点位于记录表时，`x` 仅重放选中的 DLQ/EQ 消息、`Delete` 仅删除选中的 DLQ/EQ 消息；焦点位于队列表时，两个快捷键分别重放或永久删除该队列的全部 DLQ/EQ 或全部状态。`c` 先执行 consistency repair dry-run 并展示待修复数量。每个写操作都显示影响摘要，按 `y` 确认，按 `n` 或 `Esc` 取消。shell 提供持久 history、Tab 补全、同样的分页浏览及 JSON 输出；补全读取最多一页队列或记录，不会执行无界扫描。
+
+payload 默认脱敏，只有 `payload show MESSAGE_ID` 或 TUI 的 `v` 才显示。TUI 的 replay 使用既有 `dedup_mode="keep"`，成功只表示 `replay_enqueued`，业务 handler 将异步处理。所有写操作只调用公开 Broker/Admin API；shell 的 `replace` 使用 `DEDUP_SCOPE DEDUP_KEY DEDUP_TTL_SECONDS` 完整替换记录，例如 `dlq replay emails ID archive replace batch key 3600`。
+
+自动刷新和所有浏览只调用严格只读 API，不创建 SQLite schema、Redis key 或 Consumer Group，也不执行 maintenance。
+
 ## v0.5 诊断、修复与升级
 
 `health_check()` 是严格只读诊断：不会写 schema key、创建 Consumer Group、claim 或 repair。首次 `start()`

@@ -1,11 +1,14 @@
 """Taskflow 的不可变数据模型与请求对象。"""
+
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Generic, TypeVar
+
+_PageItem = TypeVar("_PageItem")
 
 
 def utc_now() -> datetime:
@@ -61,6 +64,49 @@ class TaskMessage:
     available_at: datetime | None = None
     payload_schema_name: str | None = None
     payload_schema_version: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MessageState:
+    """Read-only delivery state attached to an immutable task message."""
+
+    message: TaskMessage
+    status: MessageStatus
+    attempt: int
+    last_action: str | None = None
+    last_reason: str | None = None
+    consumer_id: str | None = None
+    delivery_id: str | None = None
+    claimed_at: datetime | None = None
+    lease_until: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MessageSummary:
+    """Message-list metadata that never reads or decodes the business payload."""
+
+    message_id: str
+    queue: str
+    status: MessageStatus
+    attempt: int
+    created_at: datetime
+    serializer_name: str
+    serializer_version: str
+    last_action: str | None = None
+    last_reason: str | None = None
+    consumer_id: str | None = None
+    delivery_id: str | None = None
+    claimed_at: datetime | None = None
+    lease_until: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Page(Generic[_PageItem]):
+    """A bounded read-only page; ``total`` is ``None`` when unavailable cheaply."""
+
+    items: tuple[_PageItem, ...]
+    next_cursor: str | None
+    total: int | None
 
 
 @dataclass(frozen=True, slots=True)

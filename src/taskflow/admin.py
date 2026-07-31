@@ -1,15 +1,23 @@
 """后端共用的管理 API 规则。"""
+
 from __future__ import annotations
 
 from .errors import ValidationError
 
 
-def resolve_replay_dedup_mode(*, dedup_mode: str | None, reuse_dedup: bool | None,
-                              has_replacement: bool) -> str:
+def resolve_replay_dedup_mode(
+    *, dedup_mode: str | None, reuse_dedup: bool | None, has_replacement: bool
+) -> str:
     """解析互斥的 keep/remove/replace 策略，并兼容旧 ``reuse_dedup``。"""
 
     if dedup_mode is None:
-        return "keep" if reuse_dedup is None or reuse_dedup else "replace" if has_replacement else "remove"
+        return (
+            "keep"
+            if reuse_dedup is None or reuse_dedup
+            else "replace"
+            if has_replacement
+            else "remove"
+        )
     if dedup_mode not in {"keep", "remove", "replace"}:
         raise ValidationError("dedup_mode 必须是 keep、remove 或 replace")
     if reuse_dedup is not None and reuse_dedup != (dedup_mode == "keep"):
