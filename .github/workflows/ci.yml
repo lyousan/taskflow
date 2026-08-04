@@ -25,6 +25,6 @@ jobs:
       - run: uv sync --extra dev --extra redis --extra pydantic --locked
       - run: uv run ruff check src tests
       - run: uv run mypy src tests
-      - run: uv run pytest --cov=taskflow -q
+      - run: uv run pytest --cov=taskqx -q
       - run: uv run pytest -m redis -q
       - run: uv build

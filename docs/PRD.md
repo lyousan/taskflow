@@ -1,6 +1,6 @@
-# Taskflow 产品需求文档（PRD）
+# Taskqx 产品需求文档（PRD）
 
-- **产品名**：Taskflow
+- **产品名**：Taskqx
 - **定位**：独立、可嵌入、异步优先的 Python 任务消息与处理框架
 - **形态**：Python package
 - **本文版本**：v0.1（历史 MVP 设计基线）
@@ -32,17 +32,17 @@
 
 本项目最初的讨论来自 BodSolve 的外部业务方需求：外部脚本会向 BodSolve 提交采集任务、拉取或接收任务结果、解析结果、根据结果扩展下一批任务、重放失败任务，并持续重复这一过程。一个典型例子是采集 A 网站的类目商品列表：业务方从一组类目初始 URL 开始，将 URL 提交给 BodSolve；取得页面结果后解析分页 URL；对新 URL 进行规范化和去重；再提交新任务，直到该类目没有新页面。
 
-该场景揭示的是通用的任务流管理需求，而不是 BodSolve 自身的内部任务调度需求。BodSolve 在此仅是可被任务处理函数调用的一个外部执行服务；Taskflow 不应复用或受限于 BodSolve 的 `Task`、`Action`、`Node`、`Impl`、存储模型或历史实现。未来同一套能力也应能服务于纯 HTTP 请求、文件处理、数据 ETL、回放、通知及任意异步脚本。
+该场景揭示的是通用的任务流管理需求，而不是 BodSolve 自身的内部任务调度需求。BodSolve 在此仅是可被任务处理函数调用的一个外部执行服务；Taskqx 不应复用或受限于 BodSolve 的 `Task`、`Action`、`Node`、`Impl`、存储模型或历史实现。未来同一套能力也应能服务于纯 HTTP 请求、文件处理、数据 ETL、回放、通知及任意异步脚本。
 
-简单的 Redis `SET + LIST` 可以实现“URL 去重 + 队列”的最小流程，但无法稳健处理 ACK、worker 宕机恢复、重试、死信、延迟投递、可观测性及任务重放。现有通用任务框架通常以“调用一个 Python 函数”为中心；而本项目更需要以“可靠地传递和消费一条业务消息”为中心。因此需要建设独立的 Taskflow package，为业务系统提供统一、可替换 backend 的任务消息基础设施。
+简单的 Redis `SET + LIST` 可以实现“URL 去重 + 队列”的最小流程，但无法稳健处理 ACK、worker 宕机恢复、重试、死信、延迟投递、可观测性及任务重放。现有通用任务框架通常以“调用一个 Python 函数”为中心；而本项目更需要以“可靠地传递和消费一条业务消息”为中心。因此需要建设独立的 Taskqx package，为业务系统提供统一、可替换 backend 的任务消息基础设施。
 
-> **边界结论**：Taskflow 是独立 Python package，不属于也不依赖 BodSolve。BodSolve、采集系统或任意 Python 服务均可作为 Taskflow 的生产者、消费者或任务处理函数的依赖方。
+> **边界结论**：Taskqx 是独立 Python package，不属于也不依赖 BodSolve。BodSolve、采集系统或任意 Python 服务均可作为 Taskqx 的生产者、消费者或任务处理函数的依赖方。
 
 ---
 
 ## 2. 产品定位
 
-Taskflow 是一个面向 `asyncio` 的任务消息框架，提供统一的任务投递、消费、确认、重试、死信、延迟、租约与去重能力，并允许替换底层消息 backend。
+Taskqx 是一个面向 `asyncio` 的任务消息框架，提供统一的任务投递、消费、确认、重试、死信、延迟、租约与去重能力，并允许替换底层消息 backend。
 
 ### 2.1 核心价值
 
@@ -88,7 +88,7 @@ MVP 不实现或不承诺：
 | `expires_at` | 可选过期时间；到期后转入 Expired Queue，不再投递 |
 | `max_attempts` | 最大投递/执行次数 |
 
-Taskflow 核心层的 `payload` 必须是 JSON-compatible 数据：`null`、布尔、数字、字符串、数组、对象。不得默认使用 `pickle`，避免安全性、跨版本与跨 backend 问题。
+Taskqx 核心层的 `payload` 必须是 JSON-compatible 数据：`null`、布尔、数字、字符串、数组、对象。不得默认使用 `pickle`，避免安全性、跨版本与跨 backend 问题。
 
 ### 3.2 Delivery（投递）
 
@@ -107,7 +107,7 @@ Delivery 是某条 Message 被某个消费者领取后形成的一次处理上�
 
 ### 3.3 Lease（租约）
 
-消费者领取任务后，Taskflow 在有限时间内认为该消费者拥有处理权。若消费者未在租约结束前 ACK、Retry、Reject 或续租，系统可将任务回收并再次投递。
+消费者领取任务后，Taskqx 在有限时间内认为该消费者拥有处理权。若消费者未在租约结束前 ACK、Retry、Reject 或续租，系统可将任务回收并再次投递。
 
 Lease 用于处理：
 
@@ -128,7 +128,7 @@ Lease 用于处理：
 
 ### 3.5 投递保证
 
-Taskflow 默认且正式承诺的投递语义为：
+Taskqx 默认且正式承诺的投递语义为：
 
 ```text
 at-least-once delivery（至少一次投递）
@@ -136,7 +136,7 @@ at-least-once delivery（至少一次投递）
 
 因此消息可能被重复处理。例如业务已执行成功，但 worker 在调用 `ack()` 前崩溃，任务会在 lease 超时后再次被投递。
 
-业务必须以幂等方式处理重复消息。Taskflow 提供 `dedup_key` 与去重扩展来减少重复提交，但不能替代业务结果的幂等性设计。去重仅发生在提交阶段，不会阻止因 lease 回收导致的重复投递。
+业务必须以幂等方式处理重复消息。Taskqx 提供 `dedup_key` 与去重扩展来减少重复提交，但不能替代业务结果的幂等性设计。去重仅发生在提交阶段，不会阻止因 lease 回收导致的重复投递。
 
 ---
 
@@ -271,7 +271,7 @@ await delivery.extend_lease(seconds=300)
 
 ### 5.4 重试
 
-Taskflow 必须提供：
+Taskqx 必须提供：
 
 - 最大尝试次数；
 - v0.1 支持显式立即重试与重试原因记录；
@@ -367,9 +367,9 @@ await broker.submit(
 - 精确去重的 `SubmissionStore` 中，“声明去重键 + 写入消息”必须原子执行；
 - 如果因已存在去重键而未提交，返回结果必须可辨识；
 - 支持不启用去重；
-- 不把 URL 规范化、业务 key 生成等领域逻辑内置到 Taskflow。
+- 不把 URL 规范化、业务 key 生成等领域逻辑内置到 Taskqx。
 
-Taskflow 不保证去重等同于业务 exactly-once。业务仍需处理消费重复和副作用幂等。
+Taskqx 不保证去重等同于业务 exactly-once。业务仍需处理消费重复和副作用幂等。
 
 ### 5.10 队列管理与观测
 
@@ -395,17 +395,17 @@ stats = await broker.inspect("crawl.fetch")
 建议指标：
 
 ```text
-taskflow_messages_submitted_total
-taskflow_messages_acked_total
-taskflow_messages_retried_total
-taskflow_messages_reclaimed_total
-taskflow_messages_dead_lettered_total
-taskflow_delivery_duration_seconds
-taskflow_queue_ready_messages
-taskflow_queue_leased_messages
-taskflow_queue_dead_letter_messages
-taskflow_queue_expired_messages
-taskflow_queue_delayed_messages  # v0.2
+taskqx_messages_submitted_total
+taskqx_messages_acked_total
+taskqx_messages_retried_total
+taskqx_messages_reclaimed_total
+taskqx_messages_dead_lettered_total
+taskqx_delivery_duration_seconds
+taskqx_queue_ready_messages
+taskqx_queue_leased_messages
+taskqx_queue_dead_letter_messages
+taskqx_queue_expired_messages
+taskqx_queue_delayed_messages  # v0.2
 ```
 
 ### 5.11 序列化与版本演进
@@ -506,7 +506,7 @@ class TaskDelivery(Protocol):
 
 ### 7.2 能力声明
 
-由于 Redis、Kafka、SQLite 的原生模型不同，Taskflow 必须显式暴露 backend 能力，而不是假定所有 backend 的性能与语义完全一致。
+由于 Redis、Kafka、SQLite 的原生模型不同，Taskqx 必须显式暴露 backend 能力，而不是假定所有 backend 的性能与语义完全一致。
 
 ```python
 @dataclass(frozen=True)
@@ -547,17 +547,17 @@ class BackendCapabilities:
 
 #### 推荐 Key 规范
 
-假设 namespace 为 `taskflow`，队列为 `crawl.fetch`：
+假设 namespace 为 `taskqx`，队列为 `crawl.fetch`：
 
 ```text
-taskflow:queue:{crawl.fetch}:stream
-taskflow:queue:{crawl.fetch}:state
-taskflow:queue:{crawl.fetch}:leases
-taskflow:queue:{crawl.fetch}:expiry
-taskflow:queue:{crawl.fetch}:dlq
-taskflow:queue:{crawl.fetch}:eq
-taskflow:queue:{crawl.fetch}:stats
-taskflow:dedup:{scope-hash}:key-hash
+taskqx:queue:{crawl.fetch}:stream
+taskqx:queue:{crawl.fetch}:state
+taskqx:queue:{crawl.fetch}:leases
+taskqx:queue:{crawl.fetch}:expiry
+taskqx:queue:{crawl.fetch}:dlq
+taskqx:queue:{crawl.fetch}:eq
+taskqx:queue:{crawl.fetch}:stats
+taskqx:dedup:{scope-hash}:key-hash
 ```
 
 实际 key 需统一编码，避免特殊字符、Redis Cluster hash slot 问题和命名冲突。
@@ -617,7 +617,7 @@ Kafka backend 在未完成独立设计与压测前，不进入 MVP。
 
 ## 9. 任务状态模型
 
-Taskflow 只维护消息投递状态，不维护业务领域状态。
+Taskqx 只维护消息投递状态，不维护业务领域状态。
 
 建议消息状态：
 
@@ -651,7 +651,7 @@ DELAYED -> expires -> EXPIRED -> Expired Queue
 
 - `ACKED` 状态可不长期保留完整消息，由 backend 按 retention 策略处理；
 - backend 的内部状态不需要与上述名称逐字一致，但对外行为必须符合该模型；
-- 业务状态如“网页抓取成功”“结果解析失败”属于业务系统，不属于 Taskflow。
+- 业务状态如“网页抓取成功”“结果解析失败”属于业务系统，不属于 Taskqx。
 
 ---
 
@@ -659,7 +659,7 @@ DELAYED -> expires -> EXPIRED -> Expired Queue
 
 ### 10.1 重试策略
 
-Taskflow 应支持默认策略与消息级覆盖：
+Taskqx 应支持默认策略与消息级覆盖：
 
 ```python
 RetryPolicy.fixed(delay=30, max_attempts=3)
@@ -674,7 +674,7 @@ RetryPolicy.exponential(
 
 ### 10.2 错误分类责任
 
-Taskflow 提供策略机制，但不理解业务错误。业务方应明确区分：
+Taskqx 提供策略机制，但不理解业务错误。业务方应明确区分：
 
 | 类型 | 推荐动作 |
 |---|---|
@@ -860,7 +860,7 @@ Redis backend 的具体性能目标需在实现后以基准测试确定。MVP �
 ## 14. 包结构建议
 
 ```text
-taskflow/
+taskqx/
 ├── pyproject.toml
 ├── README.md
 ├── docs/
@@ -872,7 +872,7 @@ taskflow/
 │   ├── redis-lifecycle.md
 │   └── migration.md
 ├── src/
-│   └── taskflow/
+│   └── taskqx/
 │       ├── __init__.py
 │       ├── types.py
 │       ├── protocols.py
@@ -973,13 +973,13 @@ Kafka backend 仅在完成独立 RFC、语义定义、故障演练和性能验�
 
 ## 16. 关键设计决策记录
 
-1. **不以 Taskiq 为核心依赖**：Taskiq 的函数调用模型与 Taskflow 的消息生命周期模型不同；后者必须可独立控制 ACK、lease、reclaim、retry 和 DLQ。
+1. **不以 Taskiq 为核心依赖**：Taskiq 的函数调用模型与 Taskqx 的消息生命周期模型不同；后者必须可独立控制 ACK、lease、reclaim、retry 和 DLQ。
 2. **默认 at-least-once**：分布式环境无法仅通过消息框架可靠提供端到端 exactly-once；业务必须保证副作用幂等。
 3. **Redis Streams 优先于 Redis List**：Consumer Group、pending、ACK、reclaim 语义更适合可靠消费。
 4. **SQLite 是开发/测试 backend，不伪装为高吞吐分布式 MQ**。
 5. **Kafka 后置**：其 partition/offset 模型与单消息 lease/ACK 存在显著差异，需要单独设计。
-6. **任务消息与业务状态分离**：Taskflow 管消息投递，不维护爬取、解析、订单、支付等业务状态机。
-7. **去重键由业务提供**：Taskflow 提供机制，不理解 URL canonicalization 或业务主键。
+6. **任务消息与业务状态分离**：Taskqx 管消息投递，不维护爬取、解析、订单、支付等业务状态机。
+7. **去重键由业务提供**：Taskqx 提供机制，不理解 URL canonicalization 或业务主键。
 8. **能力显式声明**：backend 不支持的能力必须报错，不允许隐藏语义差异。
 
 ---
@@ -1014,7 +1014,7 @@ Kafka backend 仅在完成独立 RFC、语义定义、故障演练和性能验�
 
 ## 18. 成功标准
 
-Taskflow 成功的标志不是实现了更多 backend，而是业务方能够在不理解 Redis Streams、消费组、Lua、SQLite 锁或 Kafka offset 的情况下，可靠地完成：
+Taskqx 成功的标志不是实现了更多 backend，而是业务方能够在不理解 Redis Streams、消费组、Lua、SQLite 锁或 Kafka offset 的情况下，可靠地完成：
 
 ```python
 await broker.submit(...)

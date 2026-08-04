@@ -1,12 +1,12 @@
-# Taskflow 模块边界
+# Taskqx 模块边界
 
-Taskflow 的目标是让 backend 文件只负责生命周期装配和公共入口。当前 SQLite 与 Redis 的
+Taskqx 的目标是让 backend 文件只负责生命周期装配和公共入口。当前 SQLite 与 Redis 的
 投递状态机、maintenance、Redis lifecycle observability、Admin、Redis Lua 调用布局均已独立。
 提交 Store、profile 路由、batch 编排与已提交观测已在 `submission/`；参数准备仍有
 backend-specific envelope adapter，不能以本文件弱化 `docs/roadmap.md` 的 v0.4 发布门槛。
 
 ```text
-taskflow/
+taskqx/
 ├── worker.py                 # 并发、异常分类、heartbeat、优雅关闭
 ├── retry.py                  # RetryPolicy 与 Backoff
 ├── protocols.py              # Broker / Consumer / Delivery / Store 契约

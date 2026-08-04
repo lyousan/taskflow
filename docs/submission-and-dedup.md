@@ -107,10 +107,10 @@ queue 使用 `default`。单次 `submit_many()` 必须只涉及一个 profile；
 ```python
 broker = RedisBroker(
     redis,
-    namespace="taskflow",
+    namespace="taskqx",
     submission_stores={
-        "default": RedisSubmissionStore(redis, namespace="taskflow"),
-        "exact": RedisStringDedupSubmissionStore(redis, namespace="taskflow"),
+        "default": RedisSubmissionStore(redis, namespace="taskqx"),
+        "exact": RedisStringDedupSubmissionStore(redis, namespace="taskqx"),
     },
     queue_submission_profiles={"crawl.fetch": "exact"},
 )
@@ -149,7 +149,7 @@ result = await broker.submit(
 String Dedup 使用一个独立 Redis String：
 
 ```text
-SET taskflow:dedup:{scope-hash}:key-hash <message-id> NX PX <ttl-ms>
+SET taskqx:dedup:{scope-hash}:key-hash <message-id> NX PX <ttl-ms>
 ```
 
 相同 scope + key：

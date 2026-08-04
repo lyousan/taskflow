@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
-from taskflow import FixedBackoff, RetryableError, RetryPolicy, SQLiteBroker
+from taskqx import FixedBackoff, RetryableError, RetryPolicy, SQLiteBroker
 
 
 async def main() -> None:

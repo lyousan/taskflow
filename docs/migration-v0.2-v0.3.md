@@ -30,4 +30,4 @@ name/version 解码；缺少 decoder 时现在抛出 `SerializerUnavailableError
 把消息转入显式 poison-message 处理路径。
 
 `BrokerEvent` 保留 v0.2 的 `name=` 构造器、字段顺序和 `.name` 访问；新 EventSink 代码
-建议使用标准 `TaskflowEvent.event_name`。
+建议使用标准 `TaskqxEvent.event_name`。

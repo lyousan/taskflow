@@ -1,8 +1,8 @@
-# Taskflow
+# Taskqx
 
-Taskflow 是独立、可嵌入、异步优先的 Python 任务消息框架。v0.4 提供可靠的
-至少一次投递、显式 ACK、延迟重试、租约回收、DLQ、EQ 与精确提交去重，以及可直接运行
-异步 handler 的高层 Worker。
+Taskqx 是独立、可嵌入、异步优先的 Python 任务消息框架。v0.7 提供可靠的
+至少一次投递、显式 ACK、独立生命周期 scheduler、延迟重试、租约回收、ACK tombstone、DLQ、EQ
+与精确提交去重，以及可直接运行异步 handler 的高层 Worker。
 
 内置 `SQLiteBroker` 与 `RedisBroker`。SQLite 适用于本地脚本、测试和 CI，
 不适合作为高吞吐、分布式生产队列；Redis 适用于多进程或多实例消费者。
@@ -11,14 +11,14 @@ Redis backend 使用 Streams 与 Consumer Group；主流状态变迁由 Lua 原�
 ```python
 import asyncio
 from datetime import timedelta
-from taskflow import SQLiteBroker
-from taskflow import QueueConfig
-from taskflow.retry import ExponentialBackoff, RetryPolicy
+from taskqx import SQLiteBroker
+from taskqx import QueueConfig
+from taskqx.retry import ExponentialBackoff, RetryPolicy
 
 
 async def main() -> None:
     async with SQLiteBroker(
-        "taskflow.db",
+        "taskqx.db",
         queues={"crawl.fetch": QueueConfig(max_attempts=5)},
     ) as broker:
         await broker.submit(
@@ -48,11 +48,11 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Redis 需要安装额外依赖：`pip install 'taskflow[redis]'`。使用实例可通过 URL 创建；
+Redis 需要安装额外依赖：`pip install 'taskqx[redis]'`。使用实例可通过 URL 创建；
 Worker API 与 SQLite 完全相同，适合多进程或多实例消费者：
 
 ```python
-from taskflow import RedisBroker
+from taskqx import RedisBroker
 
 
 async def main() -> None:
@@ -70,10 +70,11 @@ asyncio.run(main())
 
 ## 关键语义
 
-- Taskflow 承诺 at-least-once 投递。worker 在 `ack()` 前崩溃时，消息会在租约
+- Taskqx 承诺 at-least-once 投递。worker 在 `ack()` 前崩溃时，消息会在租约
   到期后再次投递，业务处理必须幂等。
 - `retry(delay=...)` 与 `submit(delay=...)` 会原子地进入持久化的 `DELAYED` 状态；到期后
-  maintenance 在 claim/inspect 时幂等地将其变为 READY。延迟等待期间进程重启不会丢失消息。
+  scheduler（或 `maintain()`）幂等地将其变为 READY。生产环境应独立运行 scheduler，使空闲
+  队列不依赖 claim、inspect 或 Worker 活动而推进；延迟等待期间进程重启不会丢失消息。
 - `RetryPolicy` 的 attempt 从 1 开始计数，`max_attempts=3` 表示 handler 至多执行三次。
   `RetryableError` 会按策略重试，`RejectMessage` 会直接进入 DLQ；其他异常由
   `retry_on` / `reject_on` 决定。Worker 在 handler 运行时自动 heartbeat lease。
@@ -84,13 +85,43 @@ asyncio.run(main())
 - `expires_at` 与 dedup TTL 相互独立。包括 DELAYED 在内的到期消息不会交给业务 handler，
   会进入 EQ。
 
+## v0.7：scheduler、提交草稿与可诊断性
+
+> v0.7 正在开发中，尚未发布。其 Redis keyspace 迁移、运行步骤与回滚边界见
+> [v0.6→v0.7 升级说明](docs/migration-v0.6-v0.7.md)。
+
+后台 scheduler 只推进既有消息生命周期，不领取消息或执行 handler。`queues=None` 会在每个
+tick 发现 backend 已知的队列；多个实例可以并行运行。最长正常到期延迟为 `interval` 加一次
+tick 耗时：
+
+```python
+from datetime import timedelta
+
+scheduler = broker.scheduler(interval=timedelta(seconds=1))
+await scheduler.run()  # 在独立进程或服务任务中运行；取消或 close() 时退出
+```
+
+ACK 会自动成为可查询的 tombstone，默认保留 5 分钟。可用 `QueueConfig(ack_tombstone_ttl=...)`
+或 broker 的 `default_ack_tombstone_ttl=` 调整队列策略；不需要在每次 `submit()` 时传参。scheduler
+（或显式 `maintain()`）只会在 tombstone 到期后删除仍为 ACKED 的消息，累计计数不受影响。
+
+`TaskMessage.clone()` 返回深拷贝、可提交的 `SubmitRequest` 草稿，不会复用来源 message ID、
+创建时间或投递状态。默认 `parent_id` 指向来源消息，dedup 三元组默认清除；传入
+`parent_id=None` 是无 lineage 的独立重新提交。`broker.submit_from(message, ...)` 是等价的
+显式入口。Worker、scheduler 和状态迁移失败使用 `taskqx.worker` / `taskqx.scheduler` logger
+输出安全的关联字段和原始 traceback；默认不记录 payload、metadata 或完整 dedup key。
+
+Redis 消息 hash 已迁移到 queue-scoped keyspace。升级 Redis 前必须停止生产者、Worker 和
+scheduler，备份 namespace，先运行 `taskqx --redis-url URL redis migrate-keyspace`，审阅
+dry-run 后再以 `--apply --yes` 执行；详见迁移指南。
+
 开发路线与版本验收标准见 [`docs/roadmap.md`](docs/roadmap.md)。
 v0.2 升级说明见 [`docs/migration-v0.2-v0.3.md`](docs/migration-v0.2-v0.3.md)。
 
 ## v0.4：类型化 payload、批量提交与管理
 
 `submit()`、`worker()` 和 `run()` 均支持 `payload_type`。支持 dataclass、TypedDict
-和 Pydantic v2 model（安装 `taskflow[pydantic]`）；类型只约束 payload 的编码和解码，
+和 Pydantic v2 model（安装 `taskqx[pydantic]`）；类型只约束 payload 的编码和解码，
 不改变 at-least-once 生命周期。TypedDict 的原始 `dict` 必须在提交时显式声明类型：
 
 ```python
@@ -108,7 +139,7 @@ await broker.submit(
 worker = broker.worker("image.resize", handle_resize, payload_type=ResizePayload)
 ```
 
-Taskflow 将 schema name/version 随 envelope 保存。worker 收到不匹配、字段缺失或类型
+Taskqx 将 schema name/version 随 envelope 保存。worker 收到不匹配、字段缺失或类型
 损坏的类型化 payload 时，不会做隐式转换，而是以 `poison_payload` 原因进入 DLQ。
 Admin replay 覆盖 payload 时可传 `payload_type`；未声明类型的原始 dict 覆盖会清除旧 schema，
 避免类型元数据与实际 payload 不一致。为保持 v0.3 兼容，`payload=None` 表示保留原 payload；
@@ -121,7 +152,7 @@ Admin replay 覆盖 payload 时可传 `payload_type`；未声明类型的原始 
 DLQ/EQ replay 的 `dedup_mode` 为 `keep`、`remove` 或 `replace`：保留原记录、删除原记录，
 或以新的 scope/key/TTL 原子替换。破坏性 CLI 操作必须传 `--yes`。所有 CLI JSON 都显示
 backend、namespace 和 queue；SQLite 的 namespace 为 `null`。`await broker.health_check()`
-返回结构化的连接、schema、索引/Consumer Group 和 serializer 诊断；命令行 `taskflow health`
+返回结构化的连接、schema、索引/Consumer Group 和 serializer 诊断；命令行 `taskqx health`
 输出同一份报告，任一错误检查会返回非零状态。它不验证业务 handler、外部依赖或消息业务
 语义。默认会隐藏 payload，只有
 `--include-payload` 才显示，输出可能包含敏感数据。
@@ -134,11 +165,11 @@ backend、namespace 和 queue；SQLite 的 namespace 为 `null`。`await broker.
 `check_consistency(queue)` 检查消息状态与 SQLite 审计表、或 Redis 的 ready/lease/delayed
 索引、DLQ/EQ、Stream 和 PEL 是否一致。`repair_consistency(queue)` 默认只返回 dry-run
 建议；必须显式传入 `dry_run=False` 才会修复安全的派生记录，绝不重放或删除业务 payload。
-CLI 对应 `taskflow queue check-consistency QUEUE` 和 `taskflow queue repair-consistency QUEUE`；
+CLI 对应 `taskqx queue check-consistency QUEUE` 和 `taskqx queue repair-consistency QUEUE`；
 实际修复需要 `--apply --yes`。
 
 升级、兼容和回滚见 [v0.5 migration](docs/migration-v0.4-v0.5.md)，完整发布验收项见
-[v0.5 acceptance](docs/v0.5-acceptance.md)。Taskflow 遵循 SemVer：v0.5 保持 v0.4 的公开 API
+[v0.5 acceptance](docs/v0.5-acceptance.md)。Taskqx 遵循 SemVer：v0.5 保持 v0.4 的公开 API
 兼容；废弃 API 会先在文档和 CHANGELOG 中声明。安全问题请参阅 [SECURITY.md](SECURITY.md)，
 贡献规范见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
@@ -149,9 +180,9 @@ CLI 对应 `taskflow queue check-consistency QUEUE` 和 `taskflow queue repair-c
 安装可选依赖后，可从 TTY 启动交互界面：
 
 ```bash
-pip install "taskflow[tui]"
-taskflow tui --sqlite taskflow.db
-taskflow shell --sqlite taskflow.db
+pip install "taskqx[tui]"
+taskqx tui --sqlite taskqx.db
+taskqx shell --sqlite taskqx.db
 ```
 
 TUI 使用成熟的 [Textual](https://textual.textualize.io/) 实现：health 自动刷新，队列与记录按需读取；shell 使用 `prompt_toolkit`。TUI 支持队列/消息/DLQ/EQ 浏览、显式显示 payload、队列级或单条 replay/delete，以及先执行 dry-run 再确认的 consistency repair。所有写操作仅经公开 Admin API，并在影响摘要弹框中按 `y` 确认、按 `n` 或 `Esc` 取消；payload 默认隐藏。基础安装不导入这些依赖；非 TTY 会给出使用既有 JSON CLI 的提示。完整设计、交付门槛和兼容性目标分别见 [v0.6 TUI CLI 设计](docs/v0.6-tui-cli.md)、[v0.6 验收清单](docs/v0.6-acceptance.md) 与 [v0.5→v0.6 升级说明](docs/migration-v0.5-v0.6.md)。
@@ -179,7 +210,7 @@ Redis backend 是可选的运行时依赖；但完整测试、类型检查和 re
 uv sync --extra dev --extra redis --locked
 uv run ruff check src tests
 uv run mypy src tests
-uv run pytest --cov=taskflow -q
+uv run pytest --cov=taskqx -q
 uv build
 ```
 
@@ -193,8 +224,8 @@ uv build
 
 ## 交互式运维
 
-安装 `taskflow[tui]` 后可在 TTY 中运行 `taskflow tui --sqlite taskflow.db` 或
-`taskflow shell --sqlite taskflow.db`。两者使用分页的公开 Broker/Admin API；默认脱敏
+安装 `taskqx[tui]` 后可在 TTY 中运行 `taskqx tui --sqlite taskqx.db` 或
+`taskqx shell --sqlite taskqx.db`。两者使用分页的公开 Broker/Admin API；默认脱敏
 payload。TUI 的 replay、删除和一致性修复均展示影响摘要，并要求按 `y` 确认或按 `n`/`Esc`
 取消。基础安装不导入交互依赖，非 TTY 请继续使用 JSON CLI。操作细节见
 [`docs/operations.md`](docs/operations.md)。

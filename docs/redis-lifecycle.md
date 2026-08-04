@@ -7,13 +7,13 @@
 以 `crawl.fetch` 为例：
 
 ```text
-taskflow:queue:{crawl.fetch}:stream
-taskflow:queue:{crawl.fetch}:state
-taskflow:queue:{crawl.fetch}:leases
-taskflow:queue:{crawl.fetch}:expiry
-taskflow:queue:{crawl.fetch}:dlq
-taskflow:queue:{crawl.fetch}:eq
-taskflow:queue:{crawl.fetch}:stats
+taskqx:queue:{crawl.fetch}:stream
+taskqx:queue:{crawl.fetch}:state
+taskqx:queue:{crawl.fetch}:leases
+taskqx:queue:{crawl.fetch}:expiry
+taskqx:queue:{crawl.fetch}:dlq
+taskqx:queue:{crawl.fetch}:eq
+taskqx:queue:{crawl.fetch}:stats
 ```
 
 | Key | 类型 | 作用 |

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -11,7 +12,7 @@ from uuid import uuid4
 
 import pytest
 
-from taskflow import (
+from taskqx import (
     ConsumerOptions,
     FinishOutcome,
     JsonSerializer,
@@ -60,7 +61,7 @@ async def broker() -> AsyncGenerator[RedisBroker, None]:
     """为每个用例隔离 Redis namespace，并在结束后回收测试键。"""
 
     instance = RedisBroker.from_url(
-        namespace=f"taskflow-test-{uuid4()}", pending_recovery_seconds=0.0
+        namespace=f"taskqx-test-{uuid4()}", pending_recovery_seconds=0.0
     )
     await instance.start()
     try:
@@ -231,7 +232,9 @@ async def test_v05_redis_consistency_dry_run_and_repair(broker: RedisBroker) -> 
     await broker.repair_consistency("jobs", dry_run=False)
     assert (await broker.check_consistency("jobs")).consistent
 
-    fields = await broker._redis.hgetall(broker._message_key(submitted.message_id))
+    fields = await broker._redis.hgetall(
+        broker._message_key("jobs", submitted.message_id)
+    )
     await broker._redis.xdel(broker._queue_key("jobs", "stream"), fields["entry_id"])
     assert any(
         issue.name == "missing_stream_entry"
@@ -241,7 +244,7 @@ async def test_v05_redis_consistency_dry_run_and_repair(broker: RedisBroker) -> 
     assert (await broker.check_consistency("jobs")).consistent
 
     repaired_fields = await broker._redis.hgetall(
-        broker._message_key(submitted.message_id)
+        broker._message_key("jobs", submitted.message_id)
     )
     await broker._redis.zrem(broker._queue_key("jobs", "ready"), submitted.message_id)
     await broker._redis.xdel(
@@ -280,7 +283,7 @@ async def test_v05_redis_consistency_scans_pel_beyond_first_thousand_entries(
     orphan_entry_id = entries[-1][0]
     stale_message_id = "raw-1000"
     await broker._redis.hset(
-        broker._message_key(stale_message_id),
+        broker._message_key(queue, stale_message_id),
         mapping={
             "queue": queue,
             "status": "ready",
@@ -311,12 +314,49 @@ async def test_v05_redis_cleanup_deprecated_keys_is_explicit(
 
 
 @pytest.mark.asyncio
+async def test_v07_redis_keyspace_migration_is_explicit_resumable_and_safe(
+    broker: RedisBroker,
+) -> None:
+    submitted = await broker.submit(queue="jobs", payload={"legacy": True})
+    queue_key = broker._message_key("jobs", submitted.message_id)
+    legacy_key = broker._legacy_message_key(submitted.message_id)
+    fields = await broker._redis.hgetall(queue_key)
+    await broker._redis.hset(legacy_key, mapping=fields)
+    await broker._redis.unlink(queue_key)
+    await broker._redis.hdel(broker._message_index_key(), submitted.message_id)
+
+    dry_run = await broker.migrate_keyspace()
+    assert dry_run.dry_run and dry_run.migrated == (submitted.message_id,)
+    assert await broker._redis.exists(legacy_key)
+
+    applied = await broker.migrate_keyspace(dry_run=False)
+    assert not applied.dry_run and applied.migrated == (submitted.message_id,)
+    assert not await broker._redis.exists(legacy_key)
+    assert await broker._redis.hget(broker._message_index_key(), submitted.message_id) == "jobs"
+    assert (await broker.inspect_message(submitted.message_id)).payload == {"legacy": True}  # type: ignore[union-attr]
+    assert await broker._redis.get(broker._keyspace_version_key()) == "2"
+
+    await broker._redis.hset(legacy_key, mapping=fields)
+    resumed = await broker.migrate_keyspace(dry_run=False)
+    assert resumed.resumed == (submitted.message_id,)
+    assert not await broker._redis.exists(legacy_key)
+
+    conflicting = dict(fields, status="acked")
+    await broker._redis.hset(legacy_key, mapping=conflicting)
+    conflict = await broker.migrate_keyspace(dry_run=False)
+    assert [(issue.name, issue.message_id) for issue in conflict.conflicts] == [
+        ("message_key_conflict", submitted.message_id)
+    ]
+    assert await broker._redis.exists(legacy_key)
+
+
+@pytest.mark.asyncio
 async def test_v05_redis_reads_legacy_message_without_serializer_identity(
     broker: RedisBroker,
 ) -> None:
     submitted = await broker.submit(queue="jobs", payload={"legacy": True})
     await broker._redis.hdel(
-        broker._message_key(submitted.message_id),
+        broker._message_key("jobs", submitted.message_id),
         "serializer_name",
         "serializer_version",
     )
@@ -465,7 +505,7 @@ async def test_pydantic_typed_worker_success_and_poison_path(
         nested=(Nested, ...),
         note=(str | None, None),
     )
-    WrongVersion.__taskflow_schema_version__ = "2"
+    WrongVersion.__taskqx_schema_version__ = "2"
     handled = asyncio.Event()
 
     async def handler(message) -> None:  # type: ignore[no-untyped-def]
@@ -524,7 +564,9 @@ async def test_delayed_submit_and_retry_are_not_claimed_early(
     )
     assert (await broker.inspect("jobs")).delayed == 1
     assert (
-        await broker._redis.hget(broker._message_key(submitted.message_id), "status")
+        await broker._redis.hget(
+            broker._message_key("jobs", submitted.message_id), "status"
+        )
         == "delayed"
     )
     await asyncio.sleep(0.05)
@@ -538,9 +580,59 @@ async def test_delayed_submit_and_retry_are_not_claimed_early(
     await retried.ack()
 
 
+
+@pytest.mark.asyncio
+async def test_redis_scheduler_promotes_idle_delayed_message(
+    broker: RedisBroker,
+) -> None:
+    submitted = await broker.submit(
+        queue="jobs", payload={"kind": "idle"}, delay=timedelta(milliseconds=50)
+    )
+    await asyncio.sleep(0.07)
+
+    scheduler = broker.scheduler()
+    assert await scheduler.tick() == 1
+
+    delivery = await receive(broker)
+    assert delivery.message.id == submitted.message_id
+    assert await delivery.ack() is FinishOutcome.ACKED
+
+
+@pytest.mark.asyncio
+async def test_redis_worker_logs_original_traceback_when_retry_exhausted(
+    broker: RedisBroker, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def handler(_message) -> None:
+        raise ValueError("secret handler failure")
+
+    caplog.set_level(logging.ERROR, logger="taskqx.worker")
+    worker = broker.worker(
+        "jobs",
+        handler,
+        retry_policy=RetryPolicy.fixed(delay=0, max_attempts=1),
+    )
+    await worker.start()
+    await broker.submit(queue="jobs", payload={"secret": "payload"})
+    for _ in range(200):
+        if (await broker.inspect("jobs")).dead_letters == 1:
+            break
+        await asyncio.sleep(0.005)
+    await worker.close()
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.name == "taskqx.worker"
+        and "retry limit exhausted" in record.getMessage()
+    )
+    assert record.exc_info is not None
+    assert record.__dict__["action"] == "retry"
+    assert record.__dict__["outcome"] == "dead_lettered"
+    assert "secret handler failure" not in record.getMessage()
+
 @pytest.mark.asyncio
 async def test_delayed_message_survives_redis_restart() -> None:
-    namespace = f"taskflow-delayed-restart-{uuid4()}"
+    namespace = f"taskqx-delayed-restart-{uuid4()}"
     first = RedisBroker.from_url(namespace=namespace)
     await first.start()
     try:
@@ -668,7 +760,9 @@ async def test_explicit_invalid_dedup_ttl_never_falls_back_to_default(
 async def test_binary_serializer_identity_and_ready_index(broker: RedisBroker) -> None:
     broker._serializer = BinaryJsonSerializer()
     submitted = await broker.submit(queue="jobs", payload={"binary": True})
-    state = await broker._redis.hgetall(broker._message_key(submitted.message_id))
+    state = await broker._redis.hgetall(
+        broker._message_key("jobs", submitted.message_id)
+    )
     assert (state["serializer_name"], state["serializer_version"]) == (
         "binary-json",
         "7",
@@ -693,7 +787,7 @@ async def test_redis_status_indexes_obey_lifecycle_invariants(
     broker: RedisBroker,
 ) -> None:
     submitted = await broker.submit(queue="jobs", payload={})
-    message_key = broker._message_key(submitted.message_id)
+    message_key = broker._message_key("jobs", submitted.message_id)
     stream = broker._queue_key("jobs", "stream")
     ready = broker._queue_key("jobs", "ready")
     leases = broker._queue_key("jobs", "leases")
@@ -896,7 +990,9 @@ async def test_initial_expiry_and_expired_ack_keep_indexes_and_stats_consistent(
     assert delivery.message.id == active.message_id
     await asyncio.sleep(1.05)
     await delivery.ack()
-    state = await broker._redis.hgetall(broker._message_key(active.message_id))
+    state = await broker._redis.hgetall(
+        broker._message_key("jobs", active.message_id)
+    )
     assert state["status"] == "expired"
     assert int((await broker.inspect("jobs")).acked_total) == 0
     assert all(
@@ -995,7 +1091,7 @@ async def test_extend_lease_expiry_commits_eq_transition_and_observability(
 
 @pytest.mark.asyncio
 async def test_queue_profiles_route_submissions_and_reject_mixed_batches() -> None:
-    namespace = f"taskflow-profile-{uuid4()}"
+    namespace = f"taskqx-profile-{uuid4()}"
     instance = RedisBroker.from_url(
         namespace=namespace,
         submission_stores={
@@ -1116,7 +1212,7 @@ def test_redis_namespace_must_be_a_safe_persistent_identifier() -> None:
 
 @pytest.mark.asyncio
 async def test_redis_serializer_registry_decodes_historical_message() -> None:
-    namespace = f"taskflow-registry-{uuid4()}"
+    namespace = f"taskqx-registry-{uuid4()}"
     writer = RedisBroker.from_url(
         namespace=namespace, serializer=BinaryJsonSerializer()
     )
@@ -1136,3 +1232,37 @@ async def test_redis_serializer_registry_decodes_historical_message() -> None:
     finally:
         await clean(writer)
         await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_ack_tombstone_scheduler_deletes_only_due_acked_messages(
+    broker: RedisBroker,
+) -> None:
+    fast_broker = RedisBroker(
+        broker._redis,
+        namespace=broker._namespace,
+        default_ack_tombstone_ttl=timedelta(milliseconds=30),
+    )
+    submitted = await fast_broker.submit(
+        queue="jobs", payload={}, workflow_id="billing", parent_id="origin"
+    )
+    assert await (await receive(fast_broker)).ack() is FinishOutcome.ACKED
+    state = await fast_broker._redis.hgetall(
+        fast_broker._message_key("jobs", submitted.message_id)
+    )
+    assert state["status"] == "acked" and "acked_at" in state
+    assert await fast_broker._redis.zcard(fast_broker._queue_key("jobs", "retention")) == 1
+
+    await asyncio.sleep(0.04)
+    assert await fast_broker.maintain("jobs") == 1
+    assert await fast_broker.inspect_message(submitted.message_id) is None
+    tombstone = (await fast_broker.list_message_summaries("jobs")).items[0]
+    assert tombstone.message_id == submitted.message_id
+    assert tombstone.payload_pruned and tombstone.acked_at is not None
+    assert (tombstone.workflow_id, tombstone.parent_id) == ("billing", "origin")
+    state = await fast_broker._redis.hgetall(
+        fast_broker._message_key("jobs", submitted.message_id)
+    )
+    assert "envelope" not in state and state["payload_pruned"] == "1"
+    assert await fast_broker._redis.zcard(fast_broker._queue_key("jobs", "retention")) == 0
+    assert (await fast_broker.inspect("jobs")).acked_total == 1

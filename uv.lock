@@ -707,8 +707,8 @@ wheels = [
 ]
 
 [[package]]
-name = "taskflow"
-version = "0.6.0.dev0"
+name = "taskqx"
+version = "0.7.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },

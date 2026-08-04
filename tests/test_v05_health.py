@@ -1,11 +1,12 @@
 """v0.5 structured broker health diagnostics."""
+
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
 
-from taskflow import SQLiteBroker
+from taskqx import SQLiteBroker
 from tests.support import BinaryJsonSerializer
 
 
@@ -22,7 +23,14 @@ async def test_sqlite_health_reports_all_release_diagnostics() -> None:
     assert report.healthy
     assert report.backend == "sqlite"
     assert report.namespace is None
-    assert {"connection", "schema_version", "required_indexes", "serializer_registry", "namespace", "unrecoverable_errors"} <= checks.keys()
+    assert {
+        "connection",
+        "schema_version",
+        "required_indexes",
+        "serializer_registry",
+        "namespace",
+        "unrecoverable_errors",
+    } <= checks.keys()
     assert all(check.status == "ok" for check in checks.values())
 
 
@@ -31,7 +39,9 @@ async def test_sqlite_health_finds_missing_index_and_schema_mismatch() -> None:
     async with SQLiteBroker() as broker:
         assert broker._connection is not None
         await broker._connection.execute("DROP INDEX idx_messages_claim")
-        await broker._connection.execute("UPDATE taskflow_schema SET value='999' WHERE key='version'")
+        await broker._connection.execute(
+            "UPDATE taskqx_schema SET value='999' WHERE key='version'"
+        )
         await broker._connection.commit()
 
         report = await broker.health_check()
@@ -43,7 +53,9 @@ async def test_sqlite_health_finds_missing_index_and_schema_mismatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sqlite_health_identifies_messages_with_unavailable_serializer(tmp_path: Path) -> None:
+async def test_sqlite_health_identifies_messages_with_unavailable_serializer(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "serializer-health.db"
     async with SQLiteBroker(database, serializer=BinaryJsonSerializer()) as writer:
         await writer.submit(queue="jobs", payload={"id": 1})

@@ -17,4 +17,4 @@
 
 - SQLite 仅适合单进程、本地脚本、测试和 CI；不要作为多主机消费者或高吞吐生产队列。数据库锁等待或持续接近 1 MiB payload 时使用 Redis。
 - Redis 适合多进程/多实例。32 consumer 是本机连接池安全示例，不是默认上限；按 Redis `maxclients`、网络 RTT、payload 与 handler 时长重新压测。
-- Taskflow 不承诺固定 msg/s 或容量。设置 queue payload 上限，监控 ready/leased/delayed，并为 maintenance、health、admin 操作保留连接池余量。
+- Taskqx 不承诺固定 msg/s 或容量。设置 queue payload 上限，监控 ready/leased/delayed，并为 maintenance、health、admin 操作保留连接池余量。

@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 
-from taskflow import SQLiteBroker, SubmitRequest
+from taskqx import SQLiteBroker, SubmitRequest
 
 
 async def main() -> None:

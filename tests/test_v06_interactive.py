@@ -9,8 +9,8 @@ from uuid import uuid4
 
 import pytest
 
-from taskflow import MessageStatus, RedisBroker, SQLiteBroker
-from taskflow.cli import main
+from taskqx import MessageStatus, RedisBroker, SQLiteBroker
+from taskqx.cli import main
 
 
 def test_interactive_commands_reject_non_tty_without_optional_dependencies(
@@ -54,7 +54,7 @@ def test_sqlite_readonly_observation_never_initializes_database(tmp_path: Path) 
 
 @pytest.mark.asyncio
 async def test_sqlite_message_summary_does_not_decode_payload(tmp_path: Path) -> None:
-    from taskflow import SerializerUnavailableError
+    from taskqx import SerializerUnavailableError
     from tests.support import BinaryJsonSerializer
 
     database = tmp_path / "serialized-message.db"
@@ -80,7 +80,7 @@ async def test_textual_dashboard_handles_empty_queue_table() -> None:
 
     from textual.widgets import DataTable
 
-    from taskflow.tui import build_tui_app
+    from taskqx.tui import build_tui_app
 
     async with SQLiteBroker() as broker:
         app = build_tui_app(broker, backend="sqlite", namespace=None)
@@ -100,7 +100,7 @@ async def test_textual_dashboard_browses_bounded_redacted_pages() -> None:
     from textual.widgets import DataTable, Footer, Input, ListView, Static
     from textual.widgets._footer import FooterKey
 
-    from taskflow.tui import build_tui_app
+    from taskqx.tui import build_tui_app
 
     async with SQLiteBroker() as broker:
         message_id = (
@@ -166,6 +166,9 @@ async def test_textual_dashboard_browses_bounded_redacted_pages() -> None:
             queue_refresh = app._last_refreshed
             assert queue_refresh is not initial_refresh
             assert queues.row_count == 25
+            assert records.row_count == 0
+            await pilot.press("enter")
+            await pilot.pause()
             assert records.row_count == 1
             row_key, _ = records.coordinate_to_cell_key(records.cursor_coordinate)
             assert row_key.value == message_id
@@ -262,14 +265,13 @@ async def test_textual_dashboard_browses_bounded_redacted_pages() -> None:
         assert dead_letters.items[0].reason == "second rejection"
 
 
-
 @pytest.mark.asyncio
 async def test_textual_dashboard_renders_reason_with_rich_markup_characters() -> None:
     pytest.importorskip("textual")
 
     from textual.widgets import Static
 
-    from taskflow.tui import build_tui_app
+    from taskqx.tui import build_tui_app
 
     reason = "[{'url': 'https://www.newbalance.com/pd/rev-iq?size=4.5'}]"
     async with SQLiteBroker() as broker:
@@ -281,8 +283,11 @@ async def test_textual_dashboard_renders_reason_with_rich_markup_characters() ->
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
             detail = app.query_one("#detail", Static).render().plain
             assert reason in detail
+
 
 @pytest.mark.asyncio
 async def test_textual_dashboard_deletes_selected_queue_after_confirmation() -> None:
@@ -290,7 +295,7 @@ async def test_textual_dashboard_deletes_selected_queue_after_confirmation() -> 
 
     from textual.widgets import DataTable, Static
 
-    from taskflow.tui import build_tui_app
+    from taskqx.tui import build_tui_app
 
     async with SQLiteBroker() as broker:
         await broker.submit(queue="emails", payload={"private": "value"})
@@ -301,6 +306,8 @@ async def test_textual_dashboard_deletes_selected_queue_after_confirmation() -> 
             await pilot.pause()
             queues = app.query_one("#queues", DataTable)
             assert queues.row_count == 1
+            await pilot.press("enter")
+            await pilot.pause()
             await pilot.press("delete")
             await pilot.pause()
             assert (
@@ -326,7 +333,7 @@ async def test_textual_dashboard_loads_record_pages_on_demand() -> None:
 
     from textual.widgets import DataTable
 
-    from taskflow.tui import build_tui_app
+    from taskqx.tui import build_tui_app
 
     async with SQLiteBroker() as broker:
         for number in range(26):
@@ -343,6 +350,9 @@ async def test_textual_dashboard_loads_record_pages_on_demand() -> None:
             await pilot.press("3")
             await pilot.pause()
             assert queues.row_count == 1
+            assert records.row_count == 0
+            await pilot.press("enter")
+            await pilot.pause()
             assert records.row_count == 25
 
             await pilot.press("]")
@@ -359,13 +369,80 @@ async def test_textual_dashboard_loads_record_pages_on_demand() -> None:
 
 
 @pytest.mark.asyncio
+async def test_textual_dashboard_activates_loaded_namespace_then_queue() -> None:
+    pytest.importorskip("textual")
+
+    from textual.widgets import DataTable, Static
+
+    from taskqx.tui import build_tui_app
+
+    class NamespaceBroker:
+        def __init__(self, wrapped: SQLiteBroker) -> None:
+            self._wrapped = wrapped
+            self._namespace = "loaded"
+            self.queue_loads = 0
+            self.message_loads = 0
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._wrapped, name)
+
+        async def list_namespaces(self) -> tuple[str, ...]:
+            return ("loaded", "other")
+
+        def select_namespace(self, namespace: str) -> None:
+            self._namespace = namespace
+
+        async def list_queues(self, **kwargs: object) -> object:
+            self.queue_loads += 1
+            return await self._wrapped.list_queues(**kwargs)  # type: ignore[arg-type]
+
+        async def list_message_summaries(
+            self, *args: object, **kwargs: object
+        ) -> object:
+            self.message_loads += 1
+            return await self._wrapped.list_message_summaries(*args, **kwargs)  # type: ignore[arg-type]
+
+    async with SQLiteBroker() as broker:
+        await broker.submit(queue="emails", payload={})
+        namespace_broker = NamespaceBroker(broker)
+        app = build_tui_app(
+            namespace_broker, backend="redis", namespace="taskqx"
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert "redis:loaded" in app.query_one("#statusbar", Static).render().plain
+            assert namespace_broker.queue_loads == namespace_broker.message_loads == 0
+
+            await pilot.press("2", "enter")
+            await pilot.pause()
+            queues = app.query_one("#queues", DataTable)
+            records = app.query_one("#records", DataTable)
+            assert namespace_broker.queue_loads == 1
+            assert queues.row_count == 1
+            assert records.row_count == namespace_broker.message_loads == 0
+
+            await pilot.press("3", "enter")
+            await pilot.pause()
+            assert namespace_broker.message_loads == 1
+            assert records.row_count == 1
+
+            await pilot.press("2", "down", "enter")
+            await pilot.pause()
+            assert app._namespace == "other"
+            assert "redis:other" in app.query_one("#statusbar", Static).render().plain
+            assert queues.row_count == 1
+            assert records.row_count == 0
+            assert namespace_broker.message_loads == 1
+
+
+@pytest.mark.asyncio
 async def test_textual_dashboard_skips_duplicate_message_summaries() -> None:
     pytest.importorskip("textual")
 
     from textual.widgets import DataTable
 
-    from taskflow import Page
-    from taskflow.tui import build_tui_app
+    from taskqx import Page
+    from taskqx.tui import build_tui_app
 
     class DuplicateSummaryBroker:
         def __init__(self, wrapped: SQLiteBroker) -> None:
@@ -389,6 +466,8 @@ async def test_textual_dashboard_skips_duplicate_message_summaries() -> None:
             await pilot.pause()
             await pilot.press("3")
             await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
 
             records = app.query_one("#records", DataTable)
             assert records.row_count == 1
@@ -406,7 +485,7 @@ async def test_textual_dashboard_keeps_status_interactive_while_queues_load() ->
 
     from textual.widgets import DataTable
 
-    from taskflow.tui import build_tui_app
+    from taskqx.tui import build_tui_app
 
     class SlowQueueBroker:
         def __init__(self, wrapped: SQLiteBroker) -> None:
@@ -445,6 +524,8 @@ async def test_textual_dashboard_keeps_status_interactive_while_queues_load() ->
 
             slow_broker.release_queues.set()
             await pilot.press("3")
+            await pilot.pause()
+            await pilot.press("enter")
             await asyncio.wait_for(slow_broker.records_started.wait(), timeout=1)
             await pilot.pause()
             assert app.query_one("#queues", DataTable).row_count == 1
@@ -453,7 +534,7 @@ async def test_textual_dashboard_keeps_status_interactive_while_queues_load() ->
 @pytest.mark.asyncio
 async def test_textual_dashboard_quits_on_ctrl_c() -> None:
     pytest.importorskip("textual")
-    from taskflow.tui import build_tui_app
+    from taskqx.tui import build_tui_app
 
     async with SQLiteBroker() as broker:
         app = build_tui_app(
@@ -484,7 +565,7 @@ async def test_redis_namespace_discovery_uses_schema_markers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_redis_queue_listing_scans_stats_keys_not_message_records() -> None:
+async def test_redis_queue_listing_uses_persisted_catalog() -> None:
     class QueueMetadataRedis:
         def __init__(self) -> None:
             self.scans: list[str] = []
@@ -494,11 +575,11 @@ async def test_redis_queue_listing_scans_stats_keys_not_message_records() -> Non
             self, *, cursor: int, match: str, count: int
         ) -> tuple[int, list[str]]:
             self.scans.append(match)
-            return 0, [
-                "current:queue:{emails}:stats",
-                "current:queue:{emails}:stats",
-            ]
+            return 0, []
 
+        async def smembers(self, key: str) -> set[str]:
+            assert key == "current:queues"
+            return {"emails"}
         async def hgetall(self, key: str) -> dict[str, str]:
             self.stats_reads += 1
             assert key == "current:queue:{emails}:stats"
@@ -517,7 +598,7 @@ async def test_redis_queue_listing_scans_stats_keys_not_message_records() -> Non
 
     redis = QueueMetadataRedis()
     page = await RedisBroker(redis, namespace="current").list_queues()
-    assert redis.scans == ["current:queue:*:stats"]
+    assert redis.scans == []
     assert [item.queue for item in page.items] == ["emails"]
     assert redis.stats_reads == 1
 
@@ -532,13 +613,16 @@ async def test_redis_message_summary_uses_metadata_fields_only() -> None:
             self, *, cursor: int, match: str, count: int
         ) -> tuple[int, list[str]]:
             assert cursor == 0
-            assert match == "current:message:*"
+            assert match == "current:queue:{emails}:message:*"
             assert count >= 10
-            return 0, ["current:message:message-1", "current:message:message-1"]
+            return 0, [
+                "current:queue:{emails}:message:message-1",
+                "current:queue:{emails}:message:message-1",
+            ]
 
         async def hmget(self, key: str, fields: tuple[str, ...]) -> list[str | None]:
             self.metadata_reads += 1
-            assert key == "current:message:message-1"
+            assert key == "current:queue:{emails}:message:message-1"
             assert "envelope" not in fields
             values = {
                 "queue": "emails",
@@ -615,7 +699,7 @@ async def test_sqlite_operation_pages_are_bounded_and_stable() -> None:
 
 @pytest.mark.asyncio
 async def test_shell_lists_redacted_dlq_and_confirms_replay(capsys) -> None:  # type: ignore[no-untyped-def]
-    from taskflow.shell import _execute
+    from taskqx.shell import _execute
 
     class ConfirmSession:
         async def prompt_async(self, prompt: str) -> str:
@@ -646,7 +730,7 @@ async def test_shell_lists_redacted_dlq_and_confirms_replay(capsys) -> None:  # 
 
 @pytest.mark.asyncio
 async def test_shell_observation_eq_and_repair_workflows(capsys) -> None:  # type: ignore[no-untyped-def]
-    from taskflow.shell import _execute, _replay_options
+    from taskqx.shell import _execute, _replay_options
 
     class ConfirmSession:
         async def prompt_async(self, prompt: str) -> str:
@@ -719,7 +803,6 @@ async def test_shell_observation_eq_and_repair_workflows(capsys) -> None:  # typ
         assert '"deleted": true' in capsys.readouterr().out
 
 
-
 @pytest.mark.asyncio
 @pytest.mark.redis
 async def test_redis_textual_and_shell_smoke(capsys) -> None:  # type: ignore[no-untyped-def]
@@ -728,15 +811,15 @@ async def test_redis_textual_and_shell_smoke(capsys) -> None:  # type: ignore[no
 
     from textual.widgets import DataTable
 
-    from taskflow.shell import _execute
-    from taskflow.tui import build_tui_app
+    from taskqx.shell import _execute
+    from taskqx.tui import build_tui_app
 
     class Session:
         async def prompt_async(self, prompt: str) -> str:
             raise AssertionError(f"unexpected protected operation: {prompt}")
 
     broker = RedisBroker.from_url(
-        namespace=f"taskflow-v06-interactive-{uuid4()}",
+        namespace=f"taskqx-v06-interactive-{uuid4()}",
         pending_recovery_seconds=0.0,
     )
     await broker.start()
@@ -750,6 +833,8 @@ async def test_redis_textual_and_shell_smoke(capsys) -> None:  # type: ignore[no
             await pilot.press("3")
             await pilot.pause()
             assert app.query_one("#queues", DataTable).row_count == 1
+            await pilot.press("enter")
+            await pilot.pause()
             assert app.query_one("#records", DataTable).row_count == 1
             assert app._namespace == broker._namespace
             await pilot.press("ctrl+c")

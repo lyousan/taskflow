@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 
-from taskflow import SQLiteBroker
+from taskqx import SQLiteBroker
 
 
 async def main() -> None:

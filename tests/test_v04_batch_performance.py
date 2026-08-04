@@ -1,18 +1,29 @@
 """Repeatable v0.4 batch-performance and Redis round-trip evidence."""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 import pytest
 
-from taskflow import RedisSubmissionStore
-from taskflow.submission.base import PreparedSubmission
+from taskqx import RedisSubmissionStore
+from taskqx.submission.base import PreparedSubmission
 
 
 def _submission(index: int) -> PreparedSubmission:
     return PreparedSubmission(
-        f"message-{index}", "jobs", b"{}", "ready", datetime.now(timezone.utc),
-        None, None, None, None, 3, "json", "1",
+        f"message-{index}",
+        "jobs",
+        b"{}",
+        "ready",
+        datetime.now(timezone.utc),
+        None,
+        None,
+        None,
+        None,
+        3,
+        "json",
+        "1",
     )
 
 
@@ -38,13 +49,13 @@ class _EvalSpy:
 @pytest.mark.asyncio
 async def test_redis_batch_submit_uses_one_eval_vs_one_per_single_submit() -> None:
     single_client = _EvalSpy()
-    single_store = RedisSubmissionStore(single_client, namespace="taskflow-rtt-single")
+    single_store = RedisSubmissionStore(single_client, namespace="taskqx-rtt-single")
     for index in range(12):
         assert (await single_store.submit(_submission(index))).accepted
     assert len(single_client.calls) == 12
 
     batch_client = _EvalSpy()
-    batch_store = RedisSubmissionStore(batch_client, namespace="taskflow-rtt-batch")
+    batch_store = RedisSubmissionStore(batch_client, namespace="taskqx-rtt-batch")
     results = await batch_store.submit_many([_submission(index) for index in range(12)])
     assert all(item.accepted for item in results)
     assert len(batch_client.calls) == 1

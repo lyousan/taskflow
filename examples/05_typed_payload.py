@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from taskflow import SQLiteBroker
+from taskqx import SQLiteBroker
 
 
 @dataclass(frozen=True)

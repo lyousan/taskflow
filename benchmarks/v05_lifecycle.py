@@ -9,7 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from taskflow import ConsumerOptions, RedisBroker, SQLiteBroker, SubmitRequest
+from taskqx import ConsumerOptions, RedisBroker, SQLiteBroker, SubmitRequest
 
 
 async def measure(broker: SQLiteBroker | RedisBroker, count: int, concurrency: int) -> dict[str, float]:
@@ -71,10 +71,10 @@ async def measure(broker: SQLiteBroker | RedisBroker, count: int, concurrency: i
 
 
 async def main_async(count: int, redis_url: str | None, concurrency: int) -> None:
-    with tempfile.TemporaryDirectory(prefix="taskflow-v05-") as directory:
+    with tempfile.TemporaryDirectory(prefix="taskqx-v05-") as directory:
         results = {"sqlite": await measure(SQLiteBroker(Path(directory) / "tasks.db"), count, concurrency)}
     if redis_url:
-        namespace = f"taskflow-benchmark-{uuid4()}"
+        namespace = f"taskqx-benchmark-{uuid4()}"
         broker = RedisBroker.from_url(redis_url, namespace=namespace)
         try:
             results["redis"] = await measure(broker, count, concurrency)

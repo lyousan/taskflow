@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 
-from taskflow import SQLiteBroker
+from taskqx import SQLiteBroker
 
 
 async def main() -> None:
@@ -13,7 +13,7 @@ async def main() -> None:
         print(f"发送邮件给 {message.payload['to']}")
         completed.set()
 
-    async with SQLiteBroker("taskflow-example.db") as broker:
+    async with SQLiteBroker("taskqx-example.db") as broker:
         await broker.submit(queue="emails", payload={"to": "user@example.com"})
         worker = broker.worker("emails", handle_email, concurrency=4)
         await worker.start()

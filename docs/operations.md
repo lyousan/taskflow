@@ -1,10 +1,10 @@
-# v0.4 Worker、配置、观测、类型化 payload 与管理
+# v0.7 Worker、scheduler、配置、观测、类型化 payload 与管理
 
 ## v0.6 交互式运维 CLI
 
-安装可选 extra 后，`taskflow tui --sqlite taskflow.db` 启动 Textual 控制台，`taskflow shell --sqlite taskflow.db` 启动 `prompt_toolkit` shell。两者均要求 TTY；基础安装不导入交互依赖，非 TTY、缺少 extra 时均给出可操作提示并以非零状态退出，自动化场景应继续使用既有 JSON CLI。
+安装可选 extra 后，`taskqx tui --sqlite taskqx.db` 启动 Textual 控制台，`taskqx shell --sqlite taskqx.db` 启动 `prompt_toolkit` shell。两者均要求 TTY；基础安装不导入交互依赖，非 TTY、缺少 extra 时均给出可操作提示并以非零状态退出，自动化场景应继续使用既有 JSON CLI。
 
-TUI 提供 health、分页队列/消息/DLQ/EQ 浏览、过滤搜索、窄终端布局、键盘帮助与命令面板。`0` 聚焦当前主内容；`1`、`2`、`3` 分别聚焦状态、命名空间和队列；Redis 的命名空间列表由 schema marker 发现，选择后会切换当前 Broker 的观测和管理命名空间。`r` 刷新，`m`/`d`/`e` 切换消息、DLQ、EQ，`[`/`]` 翻页，`v` 显示选中消息 payload。焦点位于记录表时，`x` 仅重放选中的 DLQ/EQ 消息、`Delete` 仅删除选中的 DLQ/EQ 消息；焦点位于队列表时，两个快捷键分别重放或永久删除该队列的全部 DLQ/EQ 或全部状态。`c` 先执行 consistency repair dry-run 并展示待修复数量。每个写操作都显示影响摘要，按 `y` 确认，按 `n` 或 `Esc` 取消。shell 提供持久 history、Tab 补全、同样的分页浏览及 JSON 输出；补全读取最多一页队列或记录，不会执行无界扫描。
+TUI 提供 health、分页队列/消息/DLQ/EQ 浏览、过滤搜索、窄终端布局、键盘帮助与命令面板。`0` 聚焦当前主内容；`1`、`2`、`3` 分别聚焦状态、命名空间和队列。Redis 的命名空间列表由 schema marker 发现，标题栏显示已加载的实际 namespace；在命名空间列表按 Enter 后才切换当前 Broker，并清空后重新加载 Queue。队列表按 Enter 选中 Queue 后才加载其消息/DLQ/EQ；切换 namespace 会清空记录。`r` 刷新，`m`/`d`/`e` 切换消息、DLQ、EQ，`[`/`]` 翻页，`v` 显示选中消息 payload。焦点位于记录表时，`x` 仅重放选中的 DLQ/EQ 消息、`Delete` 仅删除选中的 DLQ/EQ 消息；焦点位于队列表时，两个快捷键分别重放或永久删除该队列的全部 DLQ/EQ 或全部状态。`c` 先执行 consistency repair dry-run 并展示待修复数量。每个写操作都显示影响摘要，按 `y` 确认，按 `n` 或 `Esc` 取消。shell 提供持久 history、Tab 补全、同样的分页浏览及 JSON 输出；补全读取最多一页队列或记录，不会执行无界扫描。
 
 payload 默认脱敏，只有 `payload show MESSAGE_ID` 或 TUI 的 `v` 才显示。TUI 的 replay 使用既有 `dedup_mode="keep"`，成功只表示 `replay_enqueued`，业务 handler 将异步处理。所有写操作只调用公开 Broker/Admin API；shell 的 `replace` 使用 `DEDUP_SCOPE DEDUP_KEY DEDUP_TTL_SECONDS` 完整替换记录，例如 `dlq replay emails ID archive replace batch key 3600`。
 
@@ -28,9 +28,9 @@ serializer identity 时按 JSON reader 读取，并在 health 中显示为可兼
 ## QueueConfig 与扩展点
 
 每个 broker 可以通过 `queues={"queue-name": QueueConfig(...)}` 配置队列默认策略：
-最大尝试次数、lease 时长、可选 RetryPolicy、dedup TTL 和 payload 大小上限。未设置
-queue RetryPolicy 时，Worker 沿用消息的 `max_attempts`；单次
-`submit()`/`worker()` 参数优先于 queue 配置，queue 配置优先于 broker 默认值。
+最大尝试次数、lease 时长、可选 RetryPolicy、dedup TTL、payload 大小上限和 ACK tombstone TTL。
+未设置 queue RetryPolicy 时，Worker 沿用消息的 `max_attempts`；单次 `submit()`/`worker()`
+参数优先于 queue 配置，queue 配置优先于 broker 默认值。
 SubmissionStore profile 在 broker 创建时校验，并可用 `submission_capabilities(queue)`
 查询实际去重和批量能力。
 
@@ -46,24 +46,49 @@ graceful shutdown。状态迁移失败会暴露给调用方，避免被静默吞
 Worker 默认每个 lease 的三分之一时间自动执行一次 heartbeat；可用
 `heartbeat_seconds=` 覆盖。它只在 handler 持续运行时续租，不能改变 at-least-once 语义。
 
-当前版本没有独立的后台 scheduler。延迟消息在 claim、inspect 或显式 `maintain()` 时转为
-READY；长期空闲队列建议运行每秒一次的 maintenance loop。多个实例可以同时维护同一队列，
-转移操作是幂等的，不会重复入队。
+生产环境必须为每个活跃 backend 部署独立的 `BackendScheduler`，使空闲队列也能推进生命周期：
 
-`submit(delay=timedelta(...))` 和 `delivery.retry(delay=timedelta(...))` 将消息原子地放入
-`DELAYED`。SQLite 在同一事务中提升到期消息；Redis 以 delayed sorted set 与 Lua 原子转移。
-`maintain()`、`claim()` 和 `inspect()` 会驱动调度，因此不需要额外常驻调度进程。`expires_at`
-早于到期时间时，消息会直接进入 EQ，绝不重新交给 handler。
+```python
+scheduler = broker.scheduler(queues=None, interval=timedelta(seconds=1))
+await scheduler.run()
+```
+
+`queues=None` 每个 tick 从持久化 queue catalog（SQLite 为消息表、Redis 为 catalog）发现队列；
+指定 `queues` 时只维护给定队列。scheduler 不 claim 消息、创建业务副作用或运行 handler；多个
+实例可并行运行，SQLite 事务与 Redis Lua 条件迁移保证转移幂等。一次 tick 推进 DELAYED due、
+READY/DELAYED/LEASED expiry、租约回收和 ACK tombstone 清理；正常到期延迟最多为 `interval` 加单次
+tick 时长。tick 失败会以 `taskqx.scheduler` 的 ERROR 日志保留 traceback，并在下一个 interval
+继续；直接调用 `await scheduler.tick()` 时异常会传播给调用者。`maintain(queue)` 仍可用于受控的
+单次维护，且 claim/inspect 仍可能触发维护，但两者不能替代常驻 scheduler。
+
+`submit(delay=timedelta(...))` 和 `delivery.retry(delay=timedelta(...))` 原子地放入 `DELAYED`。
+SQLite 在事务内提升到期消息；Redis 使用 delayed sorted set 和 Lua 转移。`expires_at` 早于到期
+时间时，消息直接进入 EQ，绝不交给 handler。
 
 Redis 的 `expires_at` 和 lease 判断以 Redis server `TIME` 为准。请使用 NTP 同步 Redis 和
 应用主机；启动时若两者相差至少 5 秒，broker 会记录告警。生产者需要生成相对过期时间时，
 应确保其时钟已同步；backend 不会混用本地时间与 Redis 时间。
 
+每次 ACK 都会记录 `acked_at` 并自动登记 tombstone cleanup；默认保留 5 分钟。设置
+`QueueConfig(ack_tombstone_ttl=...)` 或 broker `default_ack_tombstone_ttl=` 可按队列调整正数
+`timedelta`。scheduler 或手动 `maintain()` 仅在 `acked_at + tombstone TTL` 到期且消息仍为 ACKED 时
+永久清除其序列化业务 envelope，并移除 cleanup index；不会删除 tombstone 的 message ID、queue、状态、
+attempt、创建/确认时间、serializer、最后操作/原因或 workflow/parent lineage，也不会改变累计 ACK 计数。
+到期后 `inspect_message()`/`observe_message()` 返回 `None`，`list_message_summaries()` 和 TUI 仍能查询
+该轻量记录并明确显示 payload 已清除；因此 retention 到期前先导出所有需要用于排障或审计的业务内容。
+
+`TaskMessage.clone()` 返回没有 message identity 或投递状态的深拷贝 `SubmitRequest` 草稿。它默认
+继承 queue、payload、metadata、workflow、expiry、max_attempts、剩余 delay 和 payload schema；
+默认以来源 ID 写入 `parent_id`，并清除 dedup key/scope/TTL。需要无 lineage 的重新提交时传入
+`parent_id=None`；需要 dedup 时必须显式传入完整三元组。`submit()` 可接受草稿或既有关键字调用
+（不可混用）；`submit_from(message, **overrides)` 等价于 `submit(message.clone(**overrides))`。每次
+提交都会生成新的 message ID 和创建时间，绝不覆盖来源消息。
+
 Broker 可接收 v0.2 兼容的 `MetricsSink`（`increment()`、`observe()`）。实现可选
 `GaugeMetricsSink.gauge()` 时，ready/leased/delayed 快照会作为 gauge 报告；否则保持
 observe 行为。它报告
 提交、重复、领取、ACK、Retry、死信、lease lost、处理耗时和 ready/leased 队列快照。
-Broker 也可接收 `EventSink`。其 `TaskflowEvent` 包含 `event_name`、backend、queue、message/delivery ID、
+Broker 也可接收 `EventSink`。其 `TaskqxEvent` 包含 `event_name`、backend、queue、message/delivery ID、
 attempt、consumer、reason、serializer、status 与时间戳。
 默认 Middleware 和 MetricsSink 的异常会被记录并隔离，不会把已经提交的消息状态伪装成失败；
 需要严格传播 hook 异常时可使用 `Middleware(fail_fast=True)`。
@@ -77,7 +102,7 @@ attempt、consumer、reason、serializer、status 与时间戳。
 dataclass、TypedDict 和 Pydantic v2 model 可通过 `payload_type` 绑定到 submit 和 worker。
 TypedDict 的提交值是普通 dict，必须显式声明 `payload_type`。类型化 worker 不会宽松转换字段：
 schema 不匹配或字段损坏会以 `poison_payload` 写入 DLQ，原始 envelope 仍可通过 Admin API 查看。
-Pydantic 是 optional extra（`taskflow[pydantic]`），正式支持范围是 v2；v1 不在兼容矩阵内。
+Pydantic 是 optional extra（`taskqx[pydantic]`），正式支持范围是 v2；v1 不在兼容矩阵内。
 
 `submit_many(..., atomic=False)` 适合导入或背填：调用方必须逐项检查
 `BatchSubmitItemResult.result` 与 `.error`，不能假定整批都成功。`atomic=True` 适合要求整批
@@ -87,10 +112,25 @@ rollback 的业务场景。两种 backend 都保持单条提交内部的 dedup�
 记录策略。payload override 可以传 `payload_type`，会执行与 submit 相同的 schema 和 payload
 size 校验。未类型化的 dict override 会清除旧 schema，以阻止错误类型标注。
 
-CLI 默认只读且会隐藏 payload。`taskflow dlq replay ... --yes` 是显式的破坏性操作；
+CLI 默认只读且会隐藏 payload。`taskqx dlq replay ... --yes` 是显式的破坏性操作；
 `--include-payload` 仅应在受控终端使用。每条输出带 backend、namespace（SQLite 为 null）和
-相关 queue。`taskflow health` 仅为 backend connectivity probe，不能当作索引、Consumer Group
+相关 queue。`taskqx health` 仅为 backend connectivity probe，不能当作索引、Consumer Group
 或业务 handler 的全量健康结论。
+
+## Redis v0.7 keyspace 迁移
+
+Redis message hash 现为 `<namespace>:queue:{<queue>}:message:<message_id>`；queue catalog、
+全局只读 `message-index` 与 queue-local retention zset 配合按 queue 维护。迁移前停止生产者、
+Worker 和 scheduler，备份整个 namespace，先执行 dry-run：
+
+```bash
+taskqx --redis-url redis://127.0.0.1:6379/2 --namespace production redis migrate-keyspace
+```
+
+审阅 JSON 中的 `migrated`、`resumed` 与 `conflicts`。仅当 `conflicts` 为空，才执行
+`--apply --yes`；中断后可重复执行，迁移器只会在 queue-scoped hash 和全局定位索引都存在后删除
+旧 hash。完整的备份、验证、故障处置和 v0.8 兼容窗口见
+[v0.6→v0.7 迁移指南](migration-v0.6-v0.7.md)。
 
 完整的开发与 release 验证需同时安装开发工具和 Redis backend：
 
@@ -98,7 +138,7 @@ CLI 默认只读且会隐藏 payload。`taskflow dlq replay ... --yes` 是显式
 uv sync --extra dev --extra redis --extra pydantic --locked
 uv run ruff check src tests
 uv run mypy src tests
-uv run pytest --cov=taskflow -q
+uv run pytest --cov=taskqx -q
 uv build
 ```
 

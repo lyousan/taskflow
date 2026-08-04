@@ -7,7 +7,7 @@ v0.4 不改变消息持久化格式、queue/namespace 命名或 at-least-once �
 
 - `submit()`、`SubmitRequest`、`worker()` 和 `run()` 新增可选 `payload_type`。dataclass 可由
   实例推断；TypedDict 的原始 dict 必须显式传入类型；Pydantic 仅正式支持 v2，需安装
-  `taskflow[pydantic]`。
+  `taskqx[pydantic]`。
 - `submit_many(..., atomic=False)` 不再在第一项异常时抛出。它返回
   `list[BatchSubmitItemResult]`，每一项按输入顺序保存 `result` 或 `error`。`atomic=True`
   仍返回 `list[SubmitResult]` 并保持全有或全无。
@@ -21,7 +21,7 @@ v0.4 不改变消息持久化格式、queue/namespace 命名或 at-least-once �
 ## 运行依赖
 
 ```bash
-pip install 'taskflow[redis,pydantic]'
+pip install 'taskqx[redis,pydantic]'
 ```
 
 Redis 和 Pydantic 都是可选能力。没有安装 Pydantic 时，dataclass/TypedDict 仍完全可用；使用
@@ -30,7 +30,7 @@ Pydantic model 时会收到明确的 payload validation 错误。Pydantic v1 不
 ## 运维与回滚
 
 CLI replay 是改变状态的操作，必须加 `--yes`。CLI 默认 redaction payload；只有在受控终端中
-临时添加 `--include-payload`。`taskflow health` 只探测 broker 连接，不能代替队列、索引或
+临时添加 `--include-payload`。`taskqx health` 只探测 broker 连接，不能代替队列、索引或
 Consumer Group 的完整健康检查。
 
 若需回滚到 v0.3，请先停止 v0.4 worker，确保没有依赖 payload schema 的 v0.4 handler 在运行；

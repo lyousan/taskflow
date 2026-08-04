@@ -1,6 +1,6 @@
-# Taskflow 开发路线图
+# Taskqx 开发路线图
 
-本文是 Taskflow 从 v0.1 MVP 发展到可直接用于一般生产项目的开发计划。它同时是版本规划、架构约束、任务拆分和验收标准，开发实现应以本文和现有设计文档为共同基线。
+本文是 Taskqx 从 v0.1 MVP 发展到可直接用于一般生产项目的开发计划。它同时是版本规划、架构约束、任务拆分和验收标准，开发实现应以本文和现有设计文档为共同基线。
 
 相关设计基线：
 
@@ -15,7 +15,7 @@
 
 ## 1. 总体目标
 
-Taskflow 最终应同时满足以下目标：
+Taskqx 最终应同时满足以下目标：
 
 1. **开箱即用**：本地使用 SQLite，无需 Redis 即可提交和消费任务；
 2. **人体工程学**：普通用户只需理解 `submit()`、`worker()`、handler 和重试策略；
@@ -25,7 +25,7 @@ Taskflow 最终应同时满足以下目标：
 6. **可运维**：能够查看队列、消息、lease、DLQ/EQ、健康状态和关键指标；
 7. **可发布**：具备类型、测试、lint、构建、迁移和版本兼容文档。
 
-Taskflow **不承诺 exactly-once 业务处理**。所有版本都必须保留以下核心原则：
+Taskqx **不承诺 exactly-once 业务处理**。所有版本都必须保留以下核心原则：
 
 - 消息投递最多一次的保证不是目标，默认是 at-least-once；
 - ACK 只能发生在业务副作用成功之后；
@@ -44,6 +44,7 @@ Taskflow **不承诺 exactly-once 业务处理**。所有版本都必须保留�
 | v0.4 | 性能、管理能力与类型化 | 批量提交、类型化任务、管理 API/CLI、replay 策略完整 |
 | v0.5 | 生产化与兼容性 | 压测、故障演练、迁移、健康检查、发布质量和稳定 API |
 | v0.6 | 交互式运维控制台 | Textual TUI、交互式 shell、队列/消息浏览与受保护管理操作 |
+| v0.7 | 可诊断性、消息生命周期与调度体验 | 完整 Worker 异常日志、消息 clone/提交 API、独立 scheduler、ACK tombstone 与 Redis keyspace 迁移、持续 TUI 优化 |
 
 版本不是简单的时间节点。每个版本只有在“功能、测试、文档、兼容性和验收”全部完成后才允许发布。
 
@@ -58,8 +59,8 @@ v0.2 的目标是把 v0.1 的可靠性内核包装成可直接用于应用开发
 用户应能够这样使用：
 
 ```python
-from taskflow import SQLiteBroker
-from taskflow.retry import ExponentialBackoff, RetryPolicy
+from taskqx import SQLiteBroker
+from taskqx.retry import ExponentialBackoff, RetryPolicy
 
 
 async def handle_email(message):
@@ -282,7 +283,7 @@ SQLite 和 Redis 必须共享同一套公共校验函数和测试。
 
 ```python
 class EventSink(Protocol):
-    async def emit(self, event: TaskflowEvent) -> None: ...
+    async def emit(self, event: TaskqxEvent) -> None: ...
 ```
 
 新增指标 Protocol：
@@ -358,7 +359,7 @@ registry.register("msgpack", "1", MsgpackSerializer())
 
 ## 5.1 版本目标
 
-v0.4 让 Taskflow 更适合中等规模应用：减少批量操作往返，提供类型化 payload，提供程序化和 CLI 管理能力，完善 DLQ/EQ replay，并在继续扩展前完成核心实现的瘦身与去腐化。
+v0.4 让 Taskqx 更适合中等规模应用：减少批量操作往返，提供类型化 payload，提供程序化和 CLI 管理能力，完善 DLQ/EQ replay，并在继续扩展前完成核心实现的瘦身与去腐化。
 
 ## 5.2 功能范围
 
@@ -471,11 +472,11 @@ await broker.admin.replay_dead_letter(...)
 CLI 示例：
 
 ```bash
-taskflow queue inspect emails
-taskflow queue list-dead-letters emails
-taskflow message inspect <message-id>
-taskflow dlq replay emails <message-id>
-taskflow health
+taskqx queue inspect emails
+taskqx queue list-dead-letters emails
+taskqx message inspect <message-id>
+taskqx dlq replay emails <message-id>
+taskqx health
 ```
 
 CLI 必须：
@@ -668,7 +669,7 @@ v0.6 在不改变消息投递语义或后端状态机的前提下，把 v0.4/v0.
 
 ## 7.1 版本目标
 
-- 提供可选安装的全屏 TUI 和适合 SSH/脚本调试的 REPL；现有非交互式 `taskflow` 命令必须保持兼容。
+- 提供可选安装的全屏 TUI 和适合 SSH/脚本调试的 REPL；现有非交互式 `taskqx` 命令必须保持兼容。
 - 让运维人员无需直接读取 Redis key 或 SQLite 表，即可完成健康诊断、队列观察、消息/DLQ 排障和一致性修复审阅。
 - 所有写操作继续只经由公开 Broker/Admin API；TUI/REPL 绝不实现或绕过 backend-specific 状态迁移。
 - 将“消息已重新投递”和“业务 handler 已成功处理”明确区分，避免把 replay enqueue 误报为业务成功。
@@ -677,11 +678,11 @@ v0.6 在不改变消息投递语义或后端状态机的前提下，把 v0.4/v0.
 
 ### A. 可选依赖与入口
 
-新增 `taskflow[tui]` extra，以 Textual 实现全屏界面；REPL 可使用 `prompt_toolkit`。计划入口：
+新增 `taskqx[tui]` extra，以 Textual 实现全屏界面；REPL 可使用 `prompt_toolkit`。计划入口：
 
 ```bash
-taskflow tui --sqlite taskflow.db
-taskflow shell --redis-url redis://host/2 --namespace payments
+taskqx tui --sqlite taskqx.db
+taskqx shell --redis-url redis://host/2 --namespace payments
 ```
 
 不安装 extra 时，现有非交互 CLI 正常可用，并对 `tui`/`shell` 给出明确的安装提示。TUI 不能要求启动 worker，不能修改 broker 的启动、Consumer Group 初始化或维护语义。
@@ -727,12 +728,34 @@ v0.6 保持 v0.5 的 Python API 与非交互 CLI 兼容。新增依赖必须为 
 
 ---
 
-# 8. 推荐代码组织
+# 8. v0.7：可诊断性、消息生命周期与调度体验
+
+完整开发范围、拟议 API、兼容性策略、实施顺序、验收门槛和待确认决策见 [`v0.7 开发计划`](v0.7-development-plan.md)。本版本以 v0.6 的公开 API、TUI 安全边界和既有 `DELAYED` 状态机为基线；v0.7 将补足独立 backend scheduler，而非另建第二套延迟状态机。
+
+## 8.1 版本目标
+
+- Worker handler 异常、重试耗尽、DLQ 及状态迁移失败具有安全、可关联的结构化日志；retry 耗尽时必须保留原始异常与完整 traceback。
+- Broker 支持以消息或提交草稿为输入；`TaskMessage.clone()` 让业务能够深拷贝并微调现有消息后安全派生新任务，而不复用原消息 identity。
+- 独立 backend scheduler 在没有 Worker、claim 或 inspect 活动时，仍按期推进 DELAYED、expiry、lease reclaim 与 ACK tombstone 清理；它可独立部署且多实例幂等。
+- Redis 消息 key 迁移为按 queue 作用域的格式，配套 queue catalog、ACK tombstone cleanup index、全局只读 lookup index 和可恢复 keyspace migration，以支持按 queue 维护和清空。
+- TUI 持续按产品反馈改善 delayed/失败/ACKED 保留状态、scheduler 健康、刷新反馈与键盘体验，并始终保持 payload 保护和受控写入边界。
+
+## 8.2 核心约束
+
+- 不改变 at-least-once、ACK、lease、DLQ/EQ 或业务幂等性语义。
+- 日志默认不得泄露 payload、凭据、完整 dedup key 或敏感 metadata；异常日志必须使用原始异常的 `exc_info`，不能仅记录字符串。
+- 消息克隆产生可提交的独立草稿；Broker 为每次新提交生成新的 message ID 和创建时间，绝不覆盖来源消息。
+- v0.7 在保留既有 `delay` / `DELAYED` 原子状态迁移的基础上，新增独立 scheduler；不得依赖 claim、inspect 或 Worker 活动来触发空闲队列的到期消息。
+- Redis key 格式变更必须具有 version、dry-run、备份建议、可重入迁移与兼容读取窗口；新旧格式并存时同一消息只能由一套状态机处理。
+
+---
+
+# 9. 推荐代码组织
 
 为了避免所有能力继续堆积在 Broker 类中，建议逐步采用以下结构：
 
 ```text
-src/taskflow/
+src/taskqx/
   broker/
     base.py
     sqlite.py
@@ -777,7 +800,7 @@ Worker 不应直接拼 Redis key，Admin 不应绕过 Store 修改提交状态�
 
 ---
 
-# 9. 每个版本的开发工作流
+# 10. 每个版本的开发工作流
 
 每个功能都必须按以下顺序落地：
 
@@ -800,7 +823,7 @@ Worker 不应直接拼 Redis key，Admin 不应绕过 Store 修改提交状态�
 
 ---
 
-# 10. 优先级建议
+# 11. 优先级建议
 
 如果开发资源有限，优先级应为：
 
@@ -833,9 +856,9 @@ Worker 不应直接拼 Redis key，Admin 不应绕过 Store 修改提交状态�
 
 ---
 
-# 11. 成熟度判断标准
+# 12. 成熟度判断标准
 
-Taskflow 可以被认为达到“适合一般生产项目使用”的阶段，需要满足：
+Taskqx 可以被认为达到“适合一般生产项目使用”的阶段，需要满足：
 
 - 新用户可以在 10 分钟内完成提交和 Worker 消费；
 - 常见异常不需要用户手写 ACK/Retry 状态机；
@@ -850,7 +873,7 @@ Taskflow 可以被认为达到“适合一般生产项目使用”的阶段，�
 最终理想的用户体验是：
 
 ```python
-broker = Taskflow.sqlite("tasks.db")
+broker = Taskqx.sqlite("tasks.db")
 
 await broker.submit("emails", SendEmail(...))
 

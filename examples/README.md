@@ -1,4 +1,4 @@
-# Taskflow 示例
+# Taskqx 示例
 
 每个示例都可以独立运行，并且只使用公开 API。安装开发依赖后，从仓库根目录执行：
 
@@ -23,6 +23,7 @@ uv run python examples/02_redis_worker.py
 | `06_low_level_delivery.py` | 显式 ACK、retry、reject 的低层 Delivery API |
 | `07_dlq_replay.py` | 查看并重放 DLQ 消息 |
 | `08_health_and_consistency.py` | health、consistency check 与 dry-run repair |
+| `09_scheduler.py` | 独立 scheduler 推进空闲队列的延迟消息 |
 
 示例为了自行结束，使用 `asyncio.Event` 等待一条消息完成。在真实服务中，应让 Worker 持续运行，
 并确保业务副作用在 `ack()` 之前完成且保持幂等。

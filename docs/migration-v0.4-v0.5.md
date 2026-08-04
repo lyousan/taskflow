@@ -5,7 +5,7 @@ v0.5 保持全部 v0.4 提交、投递、payload 与 at-least-once 语义。它�
 
 ## 自动迁移与兼容窗口
 
-- SQLite 首次由 v0.5 打开时创建 `taskflow_schema`，记录当前 schema version。旧 messages 表会沿用
+- SQLite 首次由 v0.5 打开时创建 `taskqx_schema`，记录当前 schema version。旧 messages 表会沿用
   既有 bootstrap/增量 DDL 路径，不会重写 envelope 或业务 payload；随后 `sqlite_migrations.py` 的
   v0.5 versioned migration runner 在单一事务中推进 metadata migration。
 - Redis `start()` 会用 `SETNX` 写入 `<namespace>:meta:schema_version`。已有 namespace 不会被覆盖；
@@ -29,8 +29,8 @@ applied = await broker.repair_consistency("emails", dry_run=False)
 CLI 的实际修复必须同时显式给出 `--apply --yes`：
 
 ```bash
-taskflow --redis-url redis://host/2 --namespace payments queue check-consistency emails
-taskflow --redis-url redis://host/2 --namespace payments queue repair-consistency emails --apply --yes
+taskqx --redis-url redis://host/2 --namespace payments queue check-consistency emails
+taskqx --redis-url redis://host/2 --namespace payments queue repair-consistency emails --apply --yes
 ```
 
 ## 发布前核对
@@ -38,7 +38,7 @@ taskflow --redis-url redis://host/2 --namespace payments queue repair-consistenc
 1. 备份 SQLite，或记录 Redis namespace 与 key count。
 2. 使用 v0.5 调用 `health_check()`；修复任何 `error` 后才启动 worker。
 3. 对活跃 queue 执行 `check_consistency()`；先审阅 dry-run，再决定是否修复。
-4. 滚动启动 worker；Taskflow 仍是 at-least-once，业务 handler 必须幂等。
+4. 滚动启动 worker；Taskqx 仍是 at-least-once，业务 handler 必须幂等。
 
 ## 从任意历史版本直升 v0.5
 

@@ -6,7 +6,7 @@
 ```bash
 uv run ruff check src tests
 uv run mypy src tests
-uv run pytest --cov=taskflow -q
+uv run pytest --cov=taskqx -q
 ```
 
 不要通过 `Any` 或私有实现断言绕过公共契约。破坏性管理 API 必须具有 dry-run 或显式确认边界。

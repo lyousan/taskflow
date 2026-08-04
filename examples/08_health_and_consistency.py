@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import asyncio
 
-from taskflow import SQLiteBroker
+from taskqx import SQLiteBroker
 
 
 async def main() -> None:
-    async with SQLiteBroker("taskflow-example.db") as broker:
+    async with SQLiteBroker("taskqx-example.db") as broker:
         health = await broker.health_check()
         print("healthy:", health.healthy)
         for check in health.checks:

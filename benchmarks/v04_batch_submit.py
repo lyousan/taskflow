@@ -11,11 +11,11 @@ import tempfile
 import time
 from pathlib import Path
 
-from taskflow import SQLiteBroker, SubmitRequest
+from taskqx import SQLiteBroker, SubmitRequest
 
 
 async def measure(count: int) -> tuple[float, float]:
-    with tempfile.TemporaryDirectory(prefix="taskflow-v04-batch-") as directory:
+    with tempfile.TemporaryDirectory(prefix="taskqx-v04-batch-") as directory:
         path = Path(directory) / "tasks.db"
         async with SQLiteBroker(path) as broker:
             started = time.perf_counter()
